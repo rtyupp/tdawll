@@ -1,8 +1,9 @@
 # ============================================================
-# SPY 15m AI Monitor - Alpaca Real-Time + GitHub Actions
+# SPY 15m AI Monitor - Finnhub REST (Real-Time) + GitHub Actions
 # ============================================================
 
 import os
+import time
 import requests
 import pandas as pd
 import numpy as np
@@ -15,36 +16,57 @@ from sklearn.metrics import accuracy_score
 # ===== الإعدادات من GitHub Secrets =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-ALPACA_KEY = os.environ.get("ALPACA_KEY_ID")
-ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY")
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY")
 SYMBOL = os.environ.get("SYMBOL", "SPY")
+RESOLUTION = os.environ.get("RESOLUTION", "15")  # فريم بالدقائق
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "75"))
 
-DATA_URL = "https://data.alpaca.markets"
-HEADERS = {
-    "APCA-API-KEY-ID": ALPACA_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET
-}
+# ===== 1) جلب شموع لحظية من Finnhub REST =====
+def fetch_bars(symbol, resolution="15", count=300):
+    """
+    Finnhub REST candle endpoint - بيانات لحظية حقيقية.
+    resolution: 1, 5, 15, 30, 60 (دقائق)
+    """
+    print(f"📥 Fetching {symbol} ({resolution}m) from Finnhub...")
+    to_ts = int(time.time())
+    from_ts = to_ts - count * int(resolution) * 60
 
-# ===== 1) جلب شموع 15 دقيقة من Alpaca (لحظي حقيقي) =====
-def fetch_bars(symbol, timeframe="15Min", limit=500):
-    print(f"📥 Fetching {symbol} ({timeframe}) from Alpaca...")
-    url = f"{DATA_URL}/v2/stocks/{symbol}/bars?timeframe={timeframe}&limit={limit}&adjustment=all"
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    if r.status_code == 403:
-        raise RuntimeError("403: فعّل حزمة Free IEX من لوحة Alpaca (Trading → Market Data)")
+    url = (
+        f"https://finnhub.io/api/v1/stock/candle"
+        f"?symbol={symbol}"
+        f"&resolution={resolution}"
+        f"&from={from_ts}"
+        f"&to={to_ts}"
+        f"&token={FINNHUB_KEY}"
+    )
+
+    r = requests.get(url, timeout=20)
+
     if r.status_code == 401:
-        raise RuntimeError("401: مفاتيح Alpaca خاطئة")
+        raise RuntimeError("401: مفتاح Finnhub خاطئ. تحقق من FINNHUB_KEY في Secrets.")
+    if r.status_code == 429:
+        raise RuntimeError("429: تجاوزت الحد. قلل تكرار الفحص في monitor.yml.")
     r.raise_for_status()
-    bars = r.json().get("bars", [])
-    if not bars:
-        raise ValueError("No bars returned")
-    df = pd.DataFrame(bars)
-    df = df.rename(columns={"t": "ts", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-    df["ts"] = pd.to_datetime(df["ts"], unit="ns")
-    df.set_index("ts", inplace=True)
-    df = df[["Open", "High", "Low", "Close", "Volume"]]
-    print(f"✅ Got {len(df)} candles (latest: {df.index[-1]})")
+
+    j = r.json()
+
+    if j.get("s") != "ok":
+        # السوق مغلق أو لا بيانات لهذا الرمز
+        raise ValueError(f"No data (status={j.get('s')}). السوق قد يكون مغلقاً.")
+
+    if not j.get("c"):
+        raise ValueError("Empty candles returned.")
+
+    df = pd.DataFrame({
+        "Open": j["o"],
+        "High": j["h"],
+        "Low": j["l"],
+        "Close": j["c"],
+        "Volume": j["v"],
+    }, index=pd.to_datetime(j["t"], unit="s"))
+
+    df.index.name = "Timestamp"
+    print(f"✅ Got {len(df)} candles | Latest: {df.index[-1]} | Close: ${df['Close'].iloc[-1]:.2f}")
     return df
 
 # ===== 2) المؤشرات الفنية =====
@@ -91,20 +113,22 @@ def detect_signals(df):
         signals.append(f"💥 حجم غير عادي ({last['Volume_Ratio']:.1f}x)")
     return signals
 
-# ===== 4) نموذج AI =====
+# ===== 4) نموذج AI (Ensemble) =====
 def train_and_predict(df):
     features = ["RSI", "RSI_7", "MACD", "MACD_Hist", "EMA_9", "EMA_20",
                 "BB_Upper", "BB_Lower", "Stoch_K", "Volume_Ratio"]
+
     X = df[features].copy()
     for c in X.columns:
         X[c] = (X[c] - X[c].mean()) / (X[c].std() + 1e-9)
 
+    # الهدف: تحرك > 0.3% خلال 8 شموع القادمة
     future_ret = df["Close"].shift(-8) / df["Close"] - 1
     y = np.where(future_ret > 0.003, 1, np.where(future_ret < -0.003, -1, 0))
 
     split = int(len(X) * 0.85)
     X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y[:split], y[split:]
+    y_train, y_test = y[:split], y[split:]  # ✅ slicing عادي (numpy)
 
     rf = RandomForestClassifier(n_estimators=150, max_depth=6, random_state=42, class_weight="balanced")
     gb = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
@@ -136,23 +160,25 @@ def send_telegram(message):
 
 # ===== 6) التنفيذ الرئيسي =====
 def main():
-    print("=" * 50)
-    print(f"🚀 {SYMBOL} 15m AI Monitor (Alpaca Real-Time)")
-    print("=" * 50)
+    print("=" * 55)
+    print(f"🚀 {SYMBOL} {RESOLUTION}m AI Monitor (Finnhub Real-Time)")
+    print("=" * 55)
 
-    if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, ALPACA_KEY, ALPACA_SECRET]):
-        print("❌ Missing one or more secrets. Check Settings → Secrets.")
+    if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, FINNHUB_KEY]):
+        print("❌ Missing one or more secrets (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID / FINNHUB_KEY)")
         return
 
     try:
-        df = fetch_bars(SYMBOL, "15Min", 500)
+        df = fetch_bars(SYMBOL, RESOLUTION, 300)
         df = add_indicators(df)
+
         if len(df) < 50:
-            print(f"⚠️ Insufficient data: {len(df)} rows")
+            print(f"⚠️ Insufficient data: {len(df)} rows (السوق مغلق أو بيانات قليلة)")
             return
 
         pred, proba, confidence, acc = train_and_predict(df)
         signals = detect_signals(df)
+
         signal_map = {1: "🟢 شراء", -1: "🔴 بيع", 0: "⚪ انتظار"}
         signal = signal_map.get(pred, "⚪ انتظار")
         last_price = float(df["Close"].iloc[-1])
@@ -160,13 +186,14 @@ def main():
 
         print(f"📊 Signal: {signal} | Conf: {confidence:.1f}% | Acc: {acc*100:.1f}% | Signals: {len(signals)}")
 
+        # قرار الإرسال: ثقة عالية أو إشارات قوية
         should_alert = (confidence >= MIN_CONFIDENCE and pred != 0) or len(signals) >= 2
 
         if should_alert:
             signals_text = "\n".join([f"• {s}" for s in signals]) if signals else "• لا توجد"
             urgency = "🚨" if confidence >= 85 or len(signals) >= 3 else "⚡"
             msg = f"""
-{urgency} <b>{SYMBOL} 15m ALERT (LIVE)</b> {urgency}
+{urgency} <b>{SYMBOL} {RESOLUTION}m ALERT (LIVE)</b> {urgency}
 
 <b>⏰ آخر شمعة:</b> {candle_time}
 <b>💰 السعر:</b> ${last_price:.2f}
@@ -191,7 +218,7 @@ def main():
 • انتظار: {proba.get(0, 0)}%
 • بيع: {proba.get(-1, 0)}%
 
-<i>⚡ بيانات لحظية من Alpaca - فريم 15 دقيقة</i>
+<i>⚡ بيانات لحظية من Finnhub - فريم {RESOLUTION} دقيقة</i>
 """
             if send_telegram(msg):
                 print("✅ Alert sent!")
