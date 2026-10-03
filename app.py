@@ -11,7 +11,7 @@ from ta.trend import MACD, EMAIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg')  # مهم جداً للسيرفرات بدون شاشة
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 from datetime import datetime
@@ -28,24 +28,27 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 
 app = Flask(__name__)
 
-# ===== Groq AI Client =====
+# ===== إعداد Groq AI (النموذج الصحيح المجاني) =====
 groq_client = None
 if GROQ_API_KEY:
     try:
         from groq import Groq
         groq_client = Groq(api_key=GROQ_API_KEY)
+        print("✅ Groq AI initialized successfully.")
     except Exception as e:
-        print(f"Groq init failed: {e}")
+        print(f"❌ Groq init failed: {e}")
+else:
+    print("⚠️ GROQ_API_KEY not found. AI features disabled.")
 
-# ===== ذاكرة المحادثة (آخر 10 رسائل لكل شات) =====
+# ===== ذاكرة المحادثة (آخر 10 رسائل لكل شات لمنع النسيان) =====
 chat_memory = {}
 
 SYSTEM_PROMPT = """أنت خبير تداول مالي عالمي بمستوى مؤسساتي (Hedge Fund Level). 
 معلوماتك تشمل: التحليل الفني المتقدم، إدارة المخاطر، السيولة، Order Flow، Price Action، 
-الأنماط الكلاسيكية والحديثة، الاقتصاد الكلي، تأثير الأخبار على الأسواق، علم نفس التداول.
+الأنماط الكلاسيكية والحديثة، الاقتصاد الكلي، تأثير الأخبار على الأسواق، وعلم نفس التداول.
 
 أسلوبك: دقيق، مختصر، احترافي، بالعربية الفصحى المبسطة. تستخدم المصطلحات الإنجليزية بين قوسين عند الحاجة.
-تقدم تحليلاً تعليمياً تحليلياً وليس نصيحة مالية ملزمة. دائماً تذكر المستخدم بإدارة المخاطر.
+تقدم تحليلاَ تعليمياً تحليلياً وليس نصيحة مالية ملزمة. دائماً تذكر المستخدم بإدارة المخاطر.
 إذا سُئلت عن مؤشر معين، اشرحه ثم أعطِ القراءة الحالية إن كانت متاحة."""
 
 
@@ -75,7 +78,7 @@ def tg_send_photo(photo_bytes, caption, chat_id=None):
         return False
 
 
-# ===== جلب البيانات الحية =====
+# ===== جلب البيانات الحية من Finnhub =====
 def fetch_bars(symbol, resolution="15", count=200):
     to_ts = int(time.time())
     from_ts = to_ts - count * int(resolution) * 60
@@ -92,7 +95,7 @@ def fetch_bars(symbol, resolution="15", count=200):
     return df
 
 
-# ===== حساب كل المؤشرات =====
+# ===== حساب كل المؤشرات الفنية =====
 def compute_indicators(df):
     d = df.copy()
     d["RSI"] = RSIIndicator(d["Close"], 14).rsi()
@@ -115,19 +118,22 @@ def compute_indicators(df):
     return d.dropna()
 
 
-# ===== التنبؤ بالذكاء الاصطناعي =====
+# ===== التنبؤ بالذكاء الاصطناعي المحلي (Random Forest) =====
 def predict(df):
     features = ["RSI", "RSI_7", "MACD_Hist", "EMA_9", "EMA_21",
                 "BB_Upper", "BB_Lower", "Stoch_K", "ATR"]
     X = df[features].copy()
     for c in X.columns:
         X[c] = (X[c] - X[c].mean()) / (X[c].std() + 1e-9)
+    
     future_ret = df["Close"].shift(-8) / df["Close"] - 1
     y = np.where(future_ret > 0.003, 1, np.where(future_ret < -0.003, -1, 0))
+    
     split = int(len(X) * 0.85)
     rf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42, class_weight="balanced")
     model = VotingClassifier(estimators=[("rf", rf)], voting="soft")
     model.fit(X.iloc[:split], y[:split])
+    
     last_X = X.iloc[-1:].values
     pred = int(model.predict(last_X)[0])
     proba = model.predict_proba(last_X)[0]
@@ -137,12 +143,14 @@ def predict(df):
     return pred, probs, conf
 
 
-# ===== توليد نص التحليل =====
+# ===== توليد نص التحليل الاحترافي مع خطة التداول =====
 def build_analysis_text(symbol, df, pred, probs, conf):
     last = df.iloc[-1]
     signal_map = {1: "🟢 شراء (Long)", -1: "🔴 بيع (Short)", 0: "⚪ انتظار (Neutral)"}
     atr = last["ATR"]
     price = last["Close"]
+    
+    # حساب مستويات الوقف والهدف بناءً على التقلب (ATR)
     sl_buy = price - 1.5 * atr
     tp_buy = price + 2.5 * atr
     sl_sell = price + 1.5 * atr
@@ -156,27 +164,27 @@ def build_analysis_text(symbol, df, pred, probs, conf):
 <b>السعر:</b> ${price:.2f} | <b>الاتجاه:</b> {trend}
 <b>الإشارة:</b> {signal_map.get(pred, '⚪')} | <b>الثقة:</b> {conf:.1f}%
 
-<b>📊 المؤشرات:</b>
+<b>📊 المؤشرات الرئيسية:</b>
 • RSI(14): {last['RSI']:.1f} ({rsi_zone})
 • MACD Hist: {last['MACD_Hist']:.4f}
 • Stoch K/D: {last['Stoch_K']:.1f}/{last['Stoch_D']:.1f}
 • ATR: {atr:.2f}
 • BB Width: {(last['BB_Upper']-last['BB_Lower'])/last['BB_Mid']*100:.2f}%
 
-<b>🎯 خطة التداول المقترحة:</b>"""
+<b>🎯 خطة التداول المقترحة (Risk Management):</b>"""
     if pred == 1:
-        txt += f"\n• Entry: ${price:.2f}\n• Stop Loss: ${sl_buy:.2f}\n• Take Profit: ${tp_buy:.2f}"
+        txt += f"\n• Entry: ${price:.2f}\n• Stop Loss: ${sl_buy:.2f} (-{(price-sl_buy)/price*100:.2f}%)\n• Take Profit: ${tp_buy:.2f} (+{(tp_buy-price)/price*100:.2f}%)"
     elif pred == -1:
-        txt += f"\n• Entry: ${price:.2f}\n• Stop Loss: ${sl_sell:.2f}\n• Take Profit: ${tp_sell:.2f}"
+        txt += f"\n• Entry: ${price:.2f}\n• Stop Loss: ${sl_sell:.2f} (+{(sl_sell-price)/price*100:.2f}%)\n• Take Profit: ${tp_sell:.2f} (-{(price-tp_sell)/price*100:.2f}%)"
     else:
-        txt += "\n• لا توجد إشارة واضحة - انتظر تأكيداً."
+        txt += "\n• لا توجد إشارة واضحة حالياً. انتظر تأكيداً فنياً قبل الدخول."
     
-    txt += f"\n\n<b>الاحتمالات:</b> شراء {probs.get(1,0)}% | انتظار {probs.get(0,0)}% | بيع {probs.get(-1,0)}%"
-    txt += "\n\n<i>⚠️ تحليل تعليمي - ليس نصيحة مالية. أدر رأس مالك بحكمة.</i>"
+    txt += f"\n\n<b>الاحتمالات الإحصائية:</b>\n• شراء: {probs.get(1,0)}% | انتظار: {probs.get(0,0)}% | بيع: {probs.get(-1,0)}%"
+    txt += "\n\n<i>⚠️ تنويه: هذا تحليل تعليمي مبني على الخوارزميات وليس نصيحة مالية. أدر رأس مالك بحكمة.</i>"
     return txt
 
 
-# ===== رسم الشارت الاحترافي =====
+# ===== رسم الشارت الاحترافي وإرساله كصورة =====
 def generate_chart(symbol, df):
     plot_df = df.tail(60).copy()
     ap = [
@@ -190,6 +198,7 @@ def generate_chart(symbol, df):
     buf = io.BytesIO()
     fig, axes = mpf.plot(plot_df, type="candle", style=style, addplot=ap, volume=True,
                          figsize=(12, 8), title=f"\n{symbol} - Real-Time Chart", returnfig=True)
+    
     # إضافة لوحة RSI أسفل الرسم
     ax_rsi = fig.add_subplot(3, 1, 3)
     ax_rsi.plot(plot_df.index, plot_df["RSI"], color="#00ff88", linewidth=1.5)
@@ -198,6 +207,7 @@ def generate_chart(symbol, df):
     ax_rsi.set_ylabel("RSI", color="white")
     ax_rsi.tick_params(colors="white")
     ax_rsi.set_facecolor("#141414")
+    
     plt.tight_layout()
     fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor="#0a0a0a")
     plt.close(fig)
@@ -205,45 +215,53 @@ def generate_chart(symbol, df):
     return buf.read()
 
 
-# ===== رد الذكاء الاصطناعي العام =====
+# ===== رد الذكاء الاصطناعي العام عبر Groq =====
 def ai_general_reply(user_text, chat_id):
     if not groq_client:
-        return "⚠️ محرك الذكاء الاصطناعي غير مهيأ. أضف GROQ_API_KEY في إعدادات Render."
+        return "⚠️ محرك الذكاء الاصطناعي غير مهيأ. تأكد من وجود GROQ_API_KEY في إعدادات Render."
+    
     history = chat_memory.get(chat_id, [])
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + \
                [{"role": "user", "content": user_text}]
+               
     try:
         comp = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages, temperature=0.6, max_tokens=700
+            model="llama-3.1-8b-instant",  # ✅ النموذج الصحيح والمجاني
+            messages=messages, 
+            temperature=0.6, 
+            max_tokens=700
         )
         reply = comp.choices[0].message.content
+        
+        # حفظ الذاكرة
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": reply})
         chat_memory[chat_id] = history[-20:]
+        
         return reply
     except Exception as e:
-        return f"❌ خطأ في الذكاء الاصطناعي: {e}"
+        return f"❌ خطأ في الاتصال بالذكاء الاصطناعي: {str(e)}"
 
 
-# ===== معالجة الأوامر =====
+# ===== معالجة الأوامر الذكية =====
 def handle_command(text, chat_id):
     t = text.lower().strip()
     
     if t.startswith("/start") or t == "/help":
         return ("<b>👋 أهلاً بك! أنا بوت التداول الخبير.</b>\n\n"
                 "<b>الأوامر المتاحة:</b>\n"
-                "• /analyze → تحليل فوري كامل\n"
-                "• /chart → إرسال الشارت كصورة\n"
+                "• /analyze → تحليل فوري كامل مع خطة دخول ووقف\n"
+                "• /chart → إرسال الشارت كصورة احترافية\n"
+                "• /news → آخر أخبار الشركة/السوق (عبر Finnhub)\n"
                 "• /rsi • /macd • /bb → قراءة مؤشر محدد\n"
-                "• /price → السعر الحالي\n"
-                "• أي سؤال عادي → إجابة من خبير ذكي\n\n"
+                "• /price → السعر الحالي اللحظي\n"
+                "• أي سؤال عادي → إجابة من خبير ذكي (Groq AI)\n\n"
                 "<i>اسألني عن أي شيء يتعلق بالتداول!</i>")
     
     if t.startswith("/price"):
         df = fetch_bars(SYMBOL, RESOLUTION, 50)
         if df is None:
-            return "⚠️ لا توجد بيانات (السوق قد يكون مغلقاَ)."
+            return "⚠️ لا توجد بيانات (السوق قد يكون مغلقاً)."
         return f"💰 <b>{SYMBOL}</b>: ${df['Close'].iloc[-1]:.2f}"
     
     if t.startswith("/chart"):
@@ -262,9 +280,24 @@ def handle_command(text, chat_id):
             return "⚠️ لا توجد بيانات للتحليل."
         df = compute_indicators(df)
         if len(df) < 30:
-            return "⚠️ بيانات غير كافية."
+            return "⚠️ بيانات غير كافية لإجراء التحليل الدقيق."
         pred, probs, conf = predict(df)
         return build_analysis_text(SYMBOL, df, pred, probs, conf)
+    
+    if t.startswith("/news"):
+        try:
+            url = f"https://finnhub.io/api/v1/company-news?symbol={SYMBOL}&from=2026-01-01&to={datetime.now().strftime('%Y-%m-%d')}&token={FINNHUB_KEY}"
+            r = requests.get(url, timeout=10)
+            news = r.json()
+            if not news:
+                return "📰 لا توجد أخبار حديثة لهذا الرمز."
+            top_news = news[:3]
+            msg = f"<b>📰 آخر أخبار {SYMBOL}:</b>\n\n"
+            for n in top_news:
+                msg += f"• <a href='{n['url']}'>{n['headline']}</a>\n"
+            return msg
+        except:
+            return "⚠️ تعذر جلب الأخبار."
     
     if t.startswith("/rsi"):
         df = compute_indicators(fetch_bars(SYMBOL, RESOLUTION, 100))
@@ -315,18 +348,18 @@ def webhook():
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "expert-trading-v2",
+        "bot": "expert-trading-v3",
         "symbol": SYMBOL,
         "ai_ready": bool(groq_client),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     })
 
 
-# ===== حلقة المراقبة التلقائية للخبر =====
+# ===== حلقة المراقبة التلقائية للخبر (Background Monitor) =====
 def monitor_loop():
     last_alert = 0
     time.sleep(8)
-    tg_send_text(f"✅ <b>Expert Bot Online</b>\n📡 يراقب {SYMBOL} كل {CHECK_INTERVAL//60} دقيقة\nاكتب /help للأوامر")
+    tg_send_text(f"✅ <b>Expert Bot Online (v3)</b>\n📡 يراقب {SYMBOL} كل {CHECK_INTERVAL//60} دقيقة\nاكتب /help للأوامر")
     while True:
         try:
             df = fetch_bars(SYMBOL, RESOLUTION, 200)
@@ -335,6 +368,7 @@ def monitor_loop():
                 if len(df) >= 30:
                     pred, probs, conf = predict(df)
                     now = time.time()
+                    # إرسال تنبيه فقط إذا كانت الثقة عالية ولم يتم التنبيه مؤخراً
                     if pred != 0 and conf >= MIN_CONFIDENCE and (now - last_alert) > 1800:
                         txt = build_analysis_text(SYMBOL, df, pred, probs, conf)
                         if tg_send_text(txt):
@@ -345,6 +379,7 @@ def monitor_loop():
 
 
 if __name__ == "__main__":
+    # تشغيل حلقة المراقبة في الخلفية
     threading.Thread(target=monitor_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
