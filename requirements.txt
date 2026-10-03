@@ -1,5 +1,7 @@
+flask
+requests
 pandas
 numpy
 scikit-learn
 ta
-requests
+groq
