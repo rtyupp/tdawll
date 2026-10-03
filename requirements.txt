@@ -5,3 +5,4 @@ numpy
 scikit-learn
 ta
 groq
+gunicorn==21.2.0
