@@ -1,0 +1,9 @@
+Portions of this package are adapted from TradingAgents by Tauric Research
+(https://github.com/TauricResearch/TradingAgents), licensed under the Apache License 2.0
+(see LICENSE-TradingAgents).
+
+- rating.py: copied verbatim from tradingagents/agents/rating.py (header comment added).
+- agents.py / sources.py: re-implemented in a lightweight form around the ideas of the original
+  (bull/bear debate, risk committee, portfolio manager, structured ratings, decision memory with
+  reflection, price grounding, portfolio context, StockTwits/Reddit/Polymarket/FRED sources).
+No LangChain/LangGraph code is included. The LLM remains Google Gemini via its REST API.
