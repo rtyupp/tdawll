@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 from datetime import datetime, timedelta
 
-# ===== إنشاء تطبيق Flask (هذا هو السطر الذي كان ناقصاً!) =====
+# ===== إنشاء تطبيق Flask (مطلوب لأمر gunicorn app:app) =====
 app = Flask(__name__)
 
 # ===== المتغيرات من Render Secrets =====
@@ -69,7 +69,7 @@ def tg_send_photo(photo_bytes, caption, chat_id=None):
         return False
 
 
-# ===== جلب البيانات الحية من Finnhub =====
+# ===== جلب البيانات الحية من Finnhub مع حماية ضد None =====
 def fetch_bars_safe(symbol, resolution="15", count=200):
     try:
         to_ts = int(time.time())
@@ -91,7 +91,7 @@ def fetch_bars_safe(symbol, resolution="15", count=200):
         return None
 
 
-# ===== حساب المؤشرات الفنية =====
+# ===== حساب المؤشرات الفنية مع فحص مسبق =====
 def compute_indicators(df):
     if df is None or len(df) < 20:
         return None
@@ -199,7 +199,7 @@ def generate_chart(symbol, df):
     return buf.read()
 
 
-# ===== رد الذكاء الاصطناعي العام عبر Google Gemini =====
+# ===== رد الذكاء الاصطناعي العام عبر Google Gemini (النموذج الصحيح) =====
 def ai_general_reply(user_text, chat_id):
     if not GEMINI_API_KEY:
         return "⚠️ محرك الذكاء الاصطناعي غير مهيأ. تأكد من وجود GEMINI_API_KEY في إعدادات Render."
@@ -221,7 +221,8 @@ Current User Question: {user_text}
 Please provide a professional trading analysis response in Arabic."""
 
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
+        # ✅ الإصلاح الجوهري: استخدام gemini-2.0-flash بدلاً من النسخ القديمة
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         
         payload = {
             "contents": [{
@@ -364,7 +365,7 @@ def webhook():
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "expert-trading-v5-final",
+        "bot": "expert-trading-v6-final",
         "symbol": SYMBOL,
         "ai_ready": bool(GEMINI_API_KEY),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -375,7 +376,7 @@ def health():
 def monitor_loop():
     last_alert = 0
     time.sleep(8)
-    tg_send_text(f"✅ <b>Expert Bot Online (v5 Final)</b>\n📡 يراقب {SYMBOL} كل {CHECK_INTERVAL//60} دقيقة\nاكتب /help للأوامر")
+    tg_send_text(f"✅ <b>Expert Bot Online (v6 Final)</b>\n📡 يراقب {SYMBOL} كل {CHECK_INTERVAL//60} دقيقة\nاكتب /help للأوامر")
     while True:
         try:
             raw_df = fetch_bars_safe(SYMBOL, RESOLUTION, 200)
