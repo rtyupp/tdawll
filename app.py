@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-tdawll v2 — بوت تحليل S&P 500 (SPY / SPX) على تيليجرام
+tdawll v3 — بوت تحليل S&P 500 (SPY / SPX) على تيليجرام
 البيانات: Yahoo (بدون مفتاح) + Finnhub احتياطي | الذكاء: Gemini | الاستضافة: Render المجاني
 """
 import os, io, re, json, time, html, logging, threading
@@ -29,8 +29,6 @@ FINNHUB_KEY = os.environ.get("FINNHUB_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 ALLOWED_CHATS = {x.strip() for x in os.environ.get("ALLOWED_CHAT_IDS", TELEGRAM_CHAT_ID).split(",") if x.strip()}
-ALERT_SCORE = int(os.environ.get("ALERT_SCORE", "45"))        # أقل درجة تقارب لإرسال تنبيه
-INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))       # ثواني بين الفحوصات
 BRIEFING = os.environ.get("MORNING_BRIEFING", "1") == "1"     # إحاطة قبل الافتتاح
 NOTIFY_STARTUP = os.environ.get("NOTIFY_STARTUP", "0") == "1"
 AUTO_WEBHOOK = os.environ.get("AUTO_WEBHOOK", "1") == "1"
@@ -61,7 +59,8 @@ SYSTEM = """أنت «تداول»، محلل مؤسسي متخصص في مؤشر
 7) لا تقل «اشترِ» أو «بع». قل «الفنّي يرجّح…» وأرفق المخاطرة.
 8) أسلوب عربي حاد ومباشر كمتداول محترف، بلا مقدمات ولا وعظ ولا اعتذارات.
 9) نص عادي. يمكنك **تمييز** كلمات قليلة فقط. بدون عناوين أو جداول.
-10) التزم بالطول المطلوب في الطلب."""
+10) التزم بالطول المطلوب في الطلب.
+11) عند تقييم «فرصة اقتناص»: الدخول والوقف والأهداف محسوبة بالكود فلا تغيّرها ولا تقترح بدائل. دورك تقييم السياق فقط (اتجاه يومي، VIX، أخبار، عوائق قريبة) وإعطاء حكم صريح، ولا تجامل: إن كان السياق ضد الفرصة فقل ذلك."""
 
 
 # ============================== أدوات عامة ==============================
@@ -155,9 +154,10 @@ def tg_photo(img, cap, chat_id=None, kb=None):
 
 def keyboard():
     return {"inline_keyboard": [
-        [{"text": "🧠 تحليل ذكي", "callback_data": "analyze"}, {"text": "📈 الشارت", "callback_data": "chart"}],
-        [{"text": "🎯 المستويات", "callback_data": "levels"}, {"text": "💰 السعر", "callback_data": "price"}],
-        [{"text": "📰 الأخبار", "callback_data": "news"}, {"text": "🔄 SPY ⇄ SPX", "callback_data": "switch"}],
+        [{"text": "🎯 اقتناص الفرص", "callback_data": "scan"}, {"text": "🧠 تحليل ذكي", "callback_data": "analyze"}],
+        [{"text": "📈 الشارت", "callback_data": "chart"}, {"text": "🎯 المستويات", "callback_data": "levels"}],
+        [{"text": "💰 السعر", "callback_data": "price"}, {"text": "📰 الأخبار", "callback_data": "news"}],
+        [{"text": "📊 الإحصائيات", "callback_data": "stats"}, {"text": "🔄 SPY ⇄ SPX", "callback_data": "switch"}],
     ]}
 
 
@@ -283,7 +283,8 @@ def add_indicators(df):
     ll, hh = l.rolling(14).min(), h.rolling(14).max()
     d["STOCH"] = 100 * (c - ll) / (hh - ll + 1e-9)
     d["ATR"] = _atr(h, l, c)
-    d["VOLR"] = v / (v.rolling(20).mean() + 1e-9)
+    vm = v.rolling(20).mean()
+    d["VOLR"] = np.where(vm > 0, v / (vm + 1e-9), 1.0)
     tp = (h + l + c) / 3
     day = d.index.normalize()
     cv = v.groupby(day).cumsum()
@@ -297,7 +298,9 @@ def daily_context(sym):
     if d is None or len(d) < 30:
         return None
     c = d["Close"]
-    prev = d.iloc[-2]
+    n = now_et()
+    today_incomplete = d.index[-1].date() == n.date() and n.hour * 60 + n.minute < 960
+    prev = d.iloc[-2] if today_incomplete else d.iloc[-1]       # آخر جلسة مكتملة
     P = (prev["High"] + prev["Low"] + prev["Close"]) / 3
     return dict(
         last=float(c.iloc[-1]), prev_close=float(prev["Close"]), prev_high=float(prev["High"]), prev_low=float(prev["Low"]),
@@ -422,11 +425,29 @@ def confluence(l, D, macro, ml):
     return s, why
 
 
-def snapshot():
+def dtrend_map(sym):
+    """اتجاه اليومي لكل تاريخ (حسب إغلاق اليوم السابق، بدون تسريب مستقبلي)."""
+    dd = candles(sym, "1d", "1y")
+    if dd is None or len(dd) < 60:
+        return {}
+    c = dd["Close"]; s50, s200 = c.rolling(50).mean(), c.rolling(200).mean()
+    h200 = s200.notna()
+    tr = pd.Series(0, index=dd.index)
+    tr[(c > s50) & ((c > s200) | ~h200)] = 1
+    tr[(c < s50) & ((c < s200) | ~h200)] = -1
+    tr = tr.shift(1).fillna(0)
+    return {ix.date(): int(v) for ix, v in tr.items()}
+
+
+def snapshot(closed_only=False):
     label = state["focus"]; sym = SYMBOLS[label]
     raw = candles(sym, "15m", "60d")
     if raw is None or len(raw) < 120:
         return None
+    if closed_only:                                  # نتجاهل الشمعة التي لم تُغلق بعد
+        raw = raw[raw.index + pd.Timedelta(minutes=15) <= now_et().replace(tzinfo=None)]
+        if len(raw) < 120:
+            return None
     d = add_indicators(raw).dropna(subset=["RSI", "MACD_H", "EMA21", "BBU", "STOCH", "ATR"])
     if len(d) < 100:
         return None
@@ -439,7 +460,9 @@ def snapshot():
     sess, sess_txt = session_info()
     price = float(l["Close"])
     ref = D["prev_close"] if D else float(d["Close"].iloc[-2])
+    dmap = dtrend_map(sym)
     S = dict(label=label, sym=sym, d=d, l=l, D=D, macro=macro, ml=ml, score=score, why=why, dir=direction,
+             dmap=dmap, dtrend=dmap.get(d.index[-1].date(), 0),
              price=price, chg=(price / ref - 1) * 100, atr=float(l["ATR"]), sess=sess, sess_txt=sess_txt,
              stale=(sess == "open" and age > 45), last_bar=d.index[-1])
     if direction:
@@ -547,8 +570,415 @@ def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
     return "❌ تعذّر توليد الإجابة (حد الاستخدام أو خلل مؤقت). جرّب بعد قليل."
 
 
+# ============================== محرك اقتناص الفرص (فريم 15 دقيقة) ==============================
+GRADE_MIN = {"A": 75, "B": 62, "C": 48}
+GRADE_RANK = {"A": 3, "B": 2, "C": 1}
+SETUP_AR = {"ORB": "اختراق نطاق الافتتاح", "VWAP": "استعادة/رفض VWAP", "PULLBACK": "ارتداد من EMA21 مع الاتجاه",
+            "SQUEEZE": "اختراق بعد ضغط التذبذب", "SWEEP": "كسر وهمي للسيولة + استعادة",
+            "RETEST": "إعادة اختبار أعلى/أدنى أمس بعد الاختراق", "DIVERGENCE": "دايفرجنس RSI", "EXHAUST": "ارتداد من تطرف (بولنجر+RSI)"}
+BASE_SCORE = {"ORB": 52, "VWAP": 48, "PULLBACK": 52, "SQUEEZE": 50, "SWEEP": 55, "RETEST": 52, "DIVERGENCE": 50, "EXHAUST": 45}
+REVERSAL = {"SWEEP", "DIVERGENCE", "EXHAUST", "VWAP"}
+DISABLED = {x.strip().upper() for x in os.environ.get("DISABLED_SETUPS", "").split(",") if x.strip()}
+COST_R = 0.05                                            # تكلفة افتراضية (انزلاق/عمولة) بوحدة R
+STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "/tmp"), "tdawll_state.json")
+settings = {"min_grade": os.environ.get("MIN_GRADE", "B").upper()}
+live_sigs, price_alerts, BT = [], [], {}
+_lock = threading.Lock()
+
+
+def save_state():
+    try:
+        with _lock:
+            blob = {"live_sigs": live_sigs[-300:], "price_alerts": price_alerts, "settings": settings, "focus": state["focus"]}
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("save_state: %s", e)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            b = json.load(f)
+        live_sigs[:] = b.get("live_sigs", []); price_alerts[:] = b.get("price_alerts", [])
+        settings.update(b.get("settings", {})); state["focus"] = b.get("focus", state["focus"])
+        log.info("state loaded: %d signals, %d alerts", len(live_sigs), len(price_alerts))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("load_state: %s", e)
+
+
+def prep(d):
+    """يحوّل DataFrame المؤشرات إلى مصفوفات سريعة + جدول مستويات الأيام (سببي بالكامل)."""
+    P = {k: d[k].values.astype(float) for k in ("Open", "High", "Low", "Close", "Volume", "RSI", "EMA9", "EMA21",
+                                                  "EMA50", "BBU", "BBL", "ATR", "VOLR", "VWAP")}
+    P["t"] = d.index
+    P["date"] = np.array(d.index.date)
+    P["mins"] = (d.index.hour * 60 + d.index.minute).values
+    dates = P["date"]
+    g = d.groupby(dates)
+    day = pd.DataFrame({"h": g["High"].max(), "l": g["Low"].min(), "c": g["Close"].last()})
+    day["prev_high"], day["prev_low"], day["prev_close"] = day["h"].shift(1), day["l"].shift(1), day["c"].shift(1)
+    day["hi20"] = day["h"].shift(1).rolling(20, min_periods=5).max()
+    day["lo20"] = day["l"].shift(1).rolling(20, min_periods=5).min()
+    piv = (day["prev_high"] + day["prev_low"] + day["prev_close"]) / 3
+    day["pivot"], day["r1"], day["s1"] = piv, 2 * piv - day["prev_low"], 2 * piv - day["prev_high"]
+    orm = d[(P["mins"] >= 570) & (P["mins"] < 600)]
+    og = orm.groupby(orm.index.date)
+    day["orh"], day["orl"] = og["High"].max(), og["Low"].min()
+    P["dayrows"] = day.to_dict("index")
+    n = len(d)
+    ds, de = np.zeros(n, int), np.zeros(n, int)
+    s = 0
+    for i in range(n):
+        if i == 0 or dates[i] != dates[i - 1]: s = i
+        ds[i] = s
+    e = n - 1
+    for i in range(n - 1, -1, -1):
+        if i == n - 1 or dates[i] != dates[i + 1]: e = i
+        de[i] = e
+    P["ds"], P["de"] = ds, de
+    w = (d["BBU"] - d["BBL"]) / d["Close"]
+    P["bbw_pct"] = w.rolling(100, min_periods=50).apply(lambda x: (x[:-1] < x[-1]).mean(), raw=True).values
+    return P
+
+
+def _pivots(arr, lo, hi, k, kind):
+    res = []
+    for j in range(max(lo, k), hi + 1):
+        w = arr[j - k:j + k + 1]
+        if len(w) < 2 * k + 1: continue
+        if kind == "low" and arr[j] == w.min() and (w == arr[j]).sum() == 1: res.append(j)
+        if kind == "high" and arr[j] == w.max() and (w == arr[j]).sum() == 1: res.append(j)
+    return res
+
+
+def detect(P, i, ctx):
+    """يرصد المرشّحين عند إغلاق الشمعة رقم i. لا ينظر أبداً لأي شمعة بعدها."""
+    if i < 60: return []
+    m = int(P["mins"][i])
+    if m < 600 or m >= 930: return []                    # لا إشارات أول 30 دقيقة ولا بعد 15:30
+    O, H, L, C = P["Open"], P["High"], P["Low"], P["Close"]
+    o, h, l, c = O[i], H[i], L[i], C[i]
+    atr, vw, rsi = P["ATR"][i], P["VWAP"][i], P["RSI"]
+    if not (ok(atr) and atr > 0 and ok(vw)): return []
+    rng = max(h - l, 1e-9); body = abs(c - o); uw = h - max(o, c); lw = min(o, c) - l
+    bull, bear, volr = c > o, c < o, P["VOLR"][i]
+    row = P["dayrows"].get(P["date"][i], {}); ds = int(P["ds"][i])
+    e9, e21, e50, r = P["EMA9"][i], P["EMA21"][i], P["EMA50"][i], rsi[i]
+    out = []
+
+    def add(name, dr, stop, why):
+        if name not in DISABLED and ok(stop): out.append(dict(name=name, dir=dr, stop=float(stop), why=why))
+
+    # 1) اختراق نطاق الافتتاح (أول 30 دقيقة)
+    orh, orl = row.get("orh"), row.get("orl")
+    if ok(orh) and ok(orl) and m <= 870 and ds + 2 <= i and P["mins"][ds] == 570:
+        w = orh - orl
+        if 0.8 * atr <= w <= 6 * atr and volr >= 1.1 and body >= 0.5 * rng:
+            earlier = C[ds + 2:i]
+            if bull and c > orh and not (earlier > orh).any(): add("ORB", 1, orh - 0.3 * w, f"أول إغلاق فوق {orh:.2f} (أعلى نطاق الافتتاح) بحجم {volr:.1f}x")
+            if bear and c < orl and not (earlier < orl).any(): add("ORB", -1, orl + 0.3 * w, f"أول إغلاق تحت {orl:.2f} (أدنى نطاق الافتتاح) بحجم {volr:.1f}x")
+
+    # 2) استعادة / رفض VWAP
+    V = P["VWAP"]
+    below = int((C[i - 5:i] < V[i - 5:i]).sum()); above = 5 - below
+    if bull and below >= 3 and C[i - 1] < V[i - 1] and c > vw + 0.1 * atr and body >= 0.4 * rng:
+        add("VWAP", 1, L[i - 3:i + 1].min() - 0.2 * atr, f"استعاد VWAP ({vw:.2f}) بعد {below} شموع تحته")
+    if bear and above >= 3 and C[i - 1] > V[i - 1] and c < vw - 0.1 * atr and body >= 0.4 * rng:
+        add("VWAP", -1, H[i - 3:i + 1].max() + 0.2 * atr, f"فقد VWAP ({vw:.2f}) بعد {above} شموع فوقه")
+
+    # 3) ارتداد من EMA21 داخل اتجاه منظم
+    if ok(e50) and 38 <= r <= 62:
+        if e9 > e21 > e50 and e21 > P["EMA21"][i - 5] and L[i - 2:i + 1].min() <= e21 + 0.15 * atr and c > e21 and bull and c > H[i - 1]:
+            add("PULLBACK", 1, L[i - 3:i + 1].min() - 0.3 * atr, f"لمس EMA21 ({e21:.2f}) وارتد بشمعة صاعدة تكسر قمة السابقة")
+        if e9 < e21 < e50 and e21 < P["EMA21"][i - 5] and H[i - 2:i + 1].max() >= e21 - 0.15 * atr and c < e21 and bear and c < L[i - 1]:
+            add("PULLBACK", -1, H[i - 3:i + 1].max() + 0.3 * atr, f"لمس EMA21 ({e21:.2f}) ورُفض بشمعة هابطة تكسر قاع السابقة")
+
+    # 4) اختراق بعد ضغط التذبذب
+    bp = P["bbw_pct"]
+    if ok(bp[i - 1]) and bp[i - 1] <= 0.2 and (bp[i - 8:i] <= 0.25).sum() >= 5 and volr >= 1.3 and body >= 0.5 * rng:
+        mid = (P["BBU"][i - 1] + P["BBL"][i - 1]) / 2
+        if bull and c > H[i - 10:i].max(): add("SQUEEZE", 1, mid, f"كسر قمة 10 شموع بعد انضغاط بولنجر (حجم {volr:.1f}x)")
+        if bear and c < L[i - 10:i].min(): add("SQUEEZE", -1, mid, f"كسر قاع 10 شموع بعد انضغاط بولنجر (حجم {volr:.1f}x)")
+
+    # 5) كسر وهمي للسيولة ثم استعادة
+    lows = [("أدنى أمس", row.get("prev_low")), ("أدنى 20 يوم", row.get("lo20")), ("S1", row.get("s1")), ("أدنى الافتتاح", orl)]
+    highs = [("أعلى أمس", row.get("prev_high")), ("أعلى 20 يوم", row.get("hi20")), ("R1", row.get("r1")), ("أعلى الافتتاح", orh)]
+    if rng >= 0.7 * atr and volr >= 0.9:
+        for nm, lv in lows:
+            if ok(lv) and l < lv - 0.05 * atr and c > lv and lw >= 0.5 * rng and c >= l + 0.55 * rng:
+                add("SWEEP", 1, l - 0.2 * atr, f"سحب سيولة تحت {nm} ({lv:.2f}) وأغلق فوقه بذيل طويل"); break
+        for nm, lv in highs:
+            if ok(lv) and h > lv + 0.05 * atr and c < lv and uw >= 0.5 * rng and c <= h - 0.55 * rng:
+                add("SWEEP", -1, h + 0.2 * atr, f"سحب سيولة فوق {nm} ({lv:.2f}) وأغلق تحته بذيل علوي طويل"); break
+
+    # 6) إعادة اختبار أعلى/أدنى أمس بعد الاختراق
+    ph, pl = row.get("prev_high"), row.get("prev_low")
+    if ok(ph) and (C[i - 8:i - 1] > ph).any() and l <= ph + 0.2 * atr and c > ph + 0.05 * atr and bull:
+        add("RETEST", 1, min(l, ph) - 0.4 * atr, f"اختراق أعلى أمس ({ph:.2f}) ثم إعادة اختبار ناجحة")
+    if ok(pl) and (C[i - 8:i - 1] < pl).any() and h >= pl - 0.2 * atr and c < pl - 0.05 * atr and bear:
+        add("RETEST", -1, max(h, pl) + 0.4 * atr, f"كسر أدنى أمس ({pl:.2f}) ثم إعادة اختبار فاشلة")
+
+    # 7) دايفرجنس RSI
+    L_, H_ = L, H
+    pls = _pivots(L_, i - 40 + 3, i - 3, 3, "low")
+    if len(pls) >= 2:
+        p1, p2 = pls[-2], pls[-1]
+        if p2 - p1 >= 5 and p2 >= i - 10 and L[p2] < L[p1] and rsi[p2] > rsi[p1] + 3 and rsi[p1] < 42 and bull and c > H[i - 1]:
+            add("DIVERGENCE", 1, L[p2] - 0.3 * atr, f"قاع أدنى بسعر مع قاع أعلى في RSI ({rsi[p1]:.0f}→{rsi[p2]:.0f})")
+    phs = _pivots(H_, i - 40 + 3, i - 3, 3, "high")
+    if len(phs) >= 2:
+        p1, p2 = phs[-2], phs[-1]
+        if p2 - p1 >= 5 and p2 >= i - 10 and H[p2] > H[p1] and rsi[p2] < rsi[p1] - 3 and rsi[p1] > 58 and bear and c < L[i - 1]:
+            add("DIVERGENCE", -1, H[p2] + 0.3 * atr, f"قمة أعلى بسعر مع قمة أدنى في RSI ({rsi[p1]:.0f}→{rsi[p2]:.0f})")
+
+    # 8) ارتداد من تطرف بولنجر + RSI
+    if l <= P["BBL"][i] and c > P["BBL"][i] and r <= 35 and lw >= 0.5 * rng:
+        add("EXHAUST", 1, l - 0.2 * atr, f"لمس بولنجر السفلي ورفضه مع RSI {r:.0f}")
+    if h >= P["BBU"][i] and c < P["BBU"][i] and r >= 65 and uw >= 0.5 * rng:
+        add("EXHAUST", -1, h + 0.2 * atr, f"لمس بولنجر العلوي ورفضه مع RSI {r:.0f}")
+    return out
+
+
+def finalize(P, i, ctx, cand):
+    dr, name = cand["dir"], cand["name"]
+    c, atr, m = P["Close"][i], P["ATR"][i], int(P["mins"][i])
+    risk = (c - cand["stop"]) * dr
+    if risk <= 0: return None
+    risk = max(risk, 0.8 * atr)
+    if risk > 2.5 * atr: return None                       # وقف منطقي بعيد جداً = هيكل سيء
+    stop = c - dr * risk
+    row = P["dayrows"].get(P["date"][i], {}); ds = int(P["ds"][i])
+    lv = []
+    for nm, key in (("أعلى أمس", "prev_high"), ("أدنى أمس", "prev_low"), ("أعلى 20 يوم", "hi20"), ("أدنى 20 يوم", "lo20"),
+                    ("محوري", "pivot"), ("R1", "r1"), ("S1", "s1"), ("أعلى الافتتاح", "orh"), ("أدنى الافتتاح", "orl")):
+        v = row.get(key)
+        if ok(v): lv.append((nm, float(v)))
+    if i > ds: lv += [("أعلى اليوم", float(P["High"][ds:i].max())), ("أدنى اليوم", float(P["Low"][ds:i].min()))]
+    ahead = sorted([(abs(v - c), nm, v) for nm, v in lv if (v - c) * dr > 0])
+    obstacle = next(((nm, v) for dist, nm, v in ahead if dist < 0.8 * risk), None)
+    far = [x for x in ahead if x[0] >= 1.2 * risk]
+    if far and far[0][0] <= 3 * risk: t1, t1n = far[0][2], far[0][1]
+    else: t1, t1n = c + dr * 1.5 * risk, "1.5R"
+    d1 = abs(t1 - c)
+    nxt = [x for x in far if d1 + 0.5 * risk <= x[0] <= 5 * risk]
+    if nxt: t2, t2n = nxt[0][2], nxt[0][1]
+    else: t2, t2n = c + dr * max(2.5 * risk, d1 + risk), "2.5R"
+    rr1, rr2 = d1 / risk, abs(t2 - c) / risk
+
+    s, notes = BASE_SCORE[name], [cand["why"]]
+    rev = name in REVERSAL
+    dt = ctx.get("dmap", {}).get(P["date"][i], ctx.get("dtrend", 0))
+    if dt == dr: s += 12; notes.append("يتوافق مع الاتجاه اليومي")
+    elif dt == -dr:
+        s -= 5 if rev else 12; notes.append("⚠️ يعاكس الاتجاه اليومي")
+    e9, e21, e50 = P["EMA9"][i], P["EMA21"][i], P["EMA50"][i]
+    if ok(e50):
+        if (dr == 1 and e9 > e21 > e50) or (dr == -1 and e9 < e21 < e50): s += 8; notes.append("ترتيب EMA على 15د معه")
+        elif not rev and ((dr == 1 and e9 < e21 < e50) or (dr == -1 and e9 > e21 > e50)): s -= 6; notes.append("⚠️ ترتيب EMA على 15د ضده")
+    if name != "VWAP": s += 5 if (c > P["VWAP"][i]) == (dr == 1) else -3
+    v = P["VOLR"][i]
+    if v >= 1.5: s += 8; notes.append(f"حجم قوي {v:.1f}x")
+    elif v >= 1.2: s += 4
+    elif v < 0.7: s -= 6; notes.append("⚠️ حجم ضعيف")
+    o_, h_, l_ = P["Open"][i], P["High"][i], P["Low"][i]
+    rg = max(h_ - l_, 1e-9)
+    eng = (dr == 1 and c > o_ and P["Close"][i - 1] < P["Open"][i - 1] and c >= P["Open"][i - 1] and o_ <= P["Close"][i - 1]) or \
+          (dr == -1 and c < o_ and P["Close"][i - 1] > P["Open"][i - 1] and c <= P["Open"][i - 1] and o_ >= P["Close"][i - 1])
+    pin = (dr == 1 and (min(o_, c) - l_) >= 0.5 * rg and c > o_) or (dr == -1 and (h_ - max(o_, c)) >= 0.5 * rg and c < o_)
+    if eng or pin: s += 5; notes.append("شمعة تأكيد (ابتلاع/ذيل رفض)")
+    vix = ctx.get("vix")
+    if vix:
+        if dr == 1 and vix > 25: s -= 10; notes.append(f"⚠️ VIX مرتفع {vix:.1f}")
+        if dr == -1 and vix < 14: s -= 6; notes.append(f"⚠️ VIX هادئ جداً {vix:.1f}")
+    if rr1 >= 1.5: s += 4
+    if rr2 >= 3: s += 4
+    if obstacle: s -= 10; notes.append(f"⚠️ عائق قريب: {obstacle[0]} {obstacle[1]:.2f}")
+    if 690 <= m < 810 and name in ("ORB", "SQUEEZE"): s -= 8; notes.append("⚠️ ساعات تذبذب الغداء")
+    r = P["RSI"][i]
+    if not rev and ((dr == 1 and r > 72) or (dr == -1 and r < 28)): s -= 8; notes.append(f"⚠️ RSI متطرف {r:.0f}")
+    ml = ctx.get("ml")
+    if ml and ml.get("reliable") and ml["pred"] != 0:
+        if ml["pred"] == dr: s += 5; notes.append("نموذج ML الموثوق يوافق")
+        else: s -= 10; notes.append("⚠️ نموذج ML الموثوق يعاكس")
+    if ctx.get("use_bt"):
+        st = BT.get("stats", {}).get(name)
+        if st and st["n"] >= 20 and st["avgR"] < -0.15: s -= 12; notes.append("⚠️ هذا السيناريو سلبي في الباكتست التاريخي")
+    s = int(max(0, min(100, s)))
+    grade = "A" if s >= GRADE_MIN["A"] else "B" if s >= GRADE_MIN["B"] else "C" if s >= GRADE_MIN["C"] else None
+    return dict(name=name, dir=dr, entry=float(c), stop=float(stop), t1=float(t1), t2=float(t2), t1n=t1n, t2n=t2n,
+                risk=float(risk), rr1=float(rr1), rr2=float(rr2), score=s, grade=grade, notes=notes,
+                ts=str(P["t"][i]), status="open", R=0.0)
+
+
+def signals_at(P, i, ctx):
+    res = []
+    for cd in detect(P, i, ctx):
+        sg = finalize(P, i, ctx, cd)
+        if sg and sg["grade"]: res.append(sg)
+    return sorted(res, key=lambda x: -x["score"])
+
+
+def walk_outcome(sg, H, L, C, complete):
+    dr = sg["dir"]
+    for h, l in zip(H, L):
+        if (l <= sg["stop"]) if dr == 1 else (h >= sg["stop"]): return "SL", -1.0 - COST_R     # عند التعارض داخل الشمعة نفترض الوقف أولاً
+        if (h >= sg["t1"]) if dr == 1 else (l <= sg["t1"]): return "TP1", sg["rr1"] - COST_R
+    if complete and len(C): return "EXP", (C[-1] - sg["entry"]) * dr / sg["risk"] - COST_R
+    return None
+
+
+def summarize(trades):
+    def agg(rs):
+        a = np.array(rs, float)
+        w, ls = a[a > 0].sum(), -a[a < 0].sum()
+        return dict(n=len(a), win=float((a > 0).mean()), avgR=float(a.mean()), totR=float(a.sum()),
+                    pf=float(w / ls) if ls > 0 else float("inf"))
+    by, byg = {}, {}
+    for t in trades:
+        by.setdefault(t["name"], []).append(t["R"]); byg.setdefault(t["grade"], []).append(t["R"])
+    return ({k: agg(v) for k, v in by.items()}, {k: agg(v) for k, v in byg.items()}, agg([t["R"] for t in trades]) if trades else None)
+
+
+def run_backtest(d, ctx):
+    P = prep(d); n = len(d); trades, cool = [], {}
+    for i in range(60, n - 1):
+        for sg in signals_at(P, i, ctx):
+            key = (sg["name"], sg["dir"])
+            if i - cool.get(key, -99) < 8: continue
+            cool[key] = i
+            e = int(P["de"][i]); complete = P["mins"][e] >= 945
+            res = walk_outcome(sg, P["High"][i + 1:e + 1], P["Low"][i + 1:e + 1], P["Close"][i + 1:e + 1], complete)
+            if res: trades.append(dict(name=sg["name"], grade=sg["grade"], R=res[1]))
+    return trades
+
+
+def refresh_backtest():
+    sym = SYMBOLS[state["focus"]]
+    raw = candles(sym, "15m", "60d")
+    if raw is None or len(raw) < 300: return False
+    d = add_indicators(raw).dropna(subset=["RSI", "MACD_H", "EMA21", "BBU", "STOCH", "ATR"])
+    ctx = {"dmap": dtrend_map(sym), "dtrend": 0, "vix": None, "ml": None, "use_bt": False}
+    t0 = time.time(); trades = run_backtest(d, ctx)
+    st, gr, allr = summarize(trades)
+    BT.clear(); BT.update(stats=st, grades=gr, all=allr, days=int(len(set(d.index.date))), ts=time.time(), symbol=state["focus"])
+    log.info("backtest %s: %d trades in %.1fs", state["focus"], len(trades), time.time() - t0)
+    return True
+
+
+def perf_line(name):
+    s = BT.get("stats", {}).get(name)
+    if not s or s["n"] < 5: return None
+    return f"📊 تاريخياً ({BT['days']} يوم): {s['n']} صفقة · فوز {s['win'] * 100:.0f}% · متوسط {s['avgR']:+.2f}R"
+
+
+def make_ctx(S):
+    v = S["macro"].get("vix")
+    return {"dmap": S["dmap"], "dtrend": S["dtrend"], "vix": v[0] if v else None, "ml": S["ml"], "use_bt": True}
+
+
+def watchlist(S, P):
+    i = len(S["d"]) - 1; l = S["l"]; atr = S["atr"]; c = S["price"]; out = []
+    bp = P["bbw_pct"][i]
+    if ok(bp) and bp <= 0.15:
+        out.append(f"🔸 ضغط تذبذب شديد: توقّع اختراقاً. راقب أعلى {P['High'][i - 9:i + 1].max():.2f} / أدنى {P['Low'][i - 9:i + 1].min():.2f} آخر 10 شموع")
+    ab, bl = level_list(S)
+    for nm, v in (ab[:1] + bl[:1]):
+        if abs(v - c) <= 0.5 * atr: out.append(f"🔸 السعر ملاصق لـ {nm} ({v:.2f}): انتظر رد الفعل (كسر أو رفض)")
+    e9, e21, e50 = l["EMA9"], l["EMA21"], l["EMA50"]
+    if ok(e50) and abs(c - e21) <= 0.5 * atr:
+        if e9 > e21 > e50: out.append(f"🔸 تراجع نحو EMA21 ({e21:.2f}) داخل اتجاه صاعد: ابحث عن شمعة انعكاس صاعدة")
+        if e9 < e21 < e50: out.append(f"🔸 صعود نحو EMA21 ({e21:.2f}) داخل اتجاه هابط: ابحث عن شمعة رفض")
+    if l["RSI"] >= 70: out.append(f"🔸 RSI {l['RSI']:.0f} تشبع شرائي: لا تطارد القمة، انتظر رفضاً")
+    if l["RSI"] <= 30: out.append(f"🔸 RSI {l['RSI']:.0f} تشبع بيعي: لا تطارد القاع، انتظر ارتداداً")
+    return out
+
+
+def signal_text(sg, S, ai=None, others=None):
+    side = "شراء 🟢" if sg["dir"] > 0 else "بيع 🔴"
+    ts = pd.Timestamp(sg["ts"])
+    out = [f"🎯 <b>فرصة {sg['grade']}</b> · {S['label']} · فريم 15د · جودة {sg['score']}/100",
+           f"<b>{SETUP_AR[sg['name']]}</b> — {side}",
+           f"دخول ≈ <b>{sg['entry']:.2f}</b> (إغلاق شمعة {ts:%H:%M} ET)",
+           f"وقف <b>{sg['stop']:.2f}</b> (مخاطرة {sg['risk']:.2f}$)",
+           f"هدف1 <b>{sg['t1']:.2f}</b> ({sg['rr1']:.1f}R{'' if sg['t1n'].endswith('R') else ' · ' + html.escape(sg['t1n'])}) · هدف2 <b>{sg['t2']:.2f}</b> ({sg['rr2']:.1f}R)",
+           "✅ " + html.escape("؛ ".join(sg["notes"]))]
+    pl = perf_line(sg["name"])
+    if pl: out.append(pl)
+    if others: out.append("➕ أخرى بنفس الشمعة: " + html.escape("، ".join(f"{SETUP_AR[o['name']]} {'شراء' if o['dir'] > 0 else 'بيع'} ({o['grade']})" for o in others)))
+    if ai: out.append("\n🧠 " + fmt_ai(ai))
+    return "\n".join(out)
+
+
+def sig_task(sg, others):
+    conflict = [o for o in (others or []) if o["dir"] != sg["dir"]]
+    return ("فرصة اقتناص رُصدت بالكود على فريم 15 دقيقة. الأرقام التالية محسوبة وثابتة ولا تغيّرها:\n"
+            f"السيناريو: {SETUP_AR[sg['name']]} | الاتجاه: {'شراء' if sg['dir'] > 0 else 'بيع'} | الجودة {sg['score']}/100 ({sg['grade']})\n"
+            f"دخول {sg['entry']:.2f} | وقف {sg['stop']:.2f} | هدف1 {sg['t1']:.2f} ({sg['t1n']}) | هدف2 {sg['t2']:.2f}\n"
+            f"أسباب الكود: {'؛ '.join(sg['notes'])}\n"
+            + ("تنبيه: توجد إشارة معاكسة بنفس الشمعة.\n" if conflict else "") +
+            "اكتب سطرين: (1) هل السياق (الاتجاه اليومي/VIX/الأخبار/المستويات القريبة) يدعم الفرصة أم يعارضها؟ "
+            "(2) متى لا يجوز الدخول أو أين تُبطَل. ثم سطراً أخيراً يبدأ بـ «الحكم:» مع ✅ أو ⚠️ أو ⛔ وسبب بكلمات قليلة.")
+
+
+def live_scan(force_chat=None):
+    S = snapshot(closed_only=True)
+    if not S or S["stale"]: return 0
+    d = S["d"]; P = prep(d); i = len(d) - 1
+    minr = GRADE_RANK.get(settings["min_grade"], 2)
+    sigs = [s for s in signals_at(P, i, make_ctx(S)) if GRADE_RANK[s["grade"]] >= minr]
+    fresh = []
+    for s in sigs:
+        dup = any(x["name"] == s["name"] and x["dir"] == s["dir"] and
+                  abs((pd.Timestamp(s["ts"]) - pd.Timestamp(x["ts"])).total_seconds()) < 7200 for x in live_sigs[-60:])
+        if not dup: fresh.append(s)
+    if not fresh: return 0
+    best, others = fresh[0], fresh[1:]
+    ai = brain(sig_task(best, others), card_text(S, True), None, deep=False, tokens=260)
+    cap = f"🎯 {S['label']} · {SETUP_AR[best['name']]} · {'شراء' if best['dir'] > 0 else 'بيع'} ({best['grade']})"
+    tg_photo(chart_img(S, plan=best), cap, TELEGRAM_CHAT_ID)
+    tg_text(signal_text(best, S, ai, others), TELEGRAM_CHAT_ID, keyboard())
+    with _lock: live_sigs.extend(fresh)
+    save_state()
+    return len(fresh)
+
+
+def track_outcomes(closed):
+    changed = False
+    for sg in list(live_sigs):
+        if sg["status"] != "open": continue
+        ts = pd.Timestamp(sg["ts"])
+        bars = closed[(closed.index > ts) & (closed.index.date == ts.date())]
+        if bars.empty:
+            if closed.index[-1].date() > ts.date(): sg["status"] = "EXP"; sg["R"] = 0.0; changed = True
+            continue
+        lastm = bars.index[-1].hour * 60 + bars.index[-1].minute
+        res = walk_outcome(sg, bars["High"].values, bars["Low"].values, bars["Close"].values, lastm >= 945)
+        if res:
+            sg["status"], sg["R"] = res; changed = True
+            ico = "✅" if sg["R"] > 0 else "🛑"
+            lab = {"SL": "ضرب الوقف", "TP1": "تحقق الهدف1", "EXP": "إغلاق نهاية الجلسة"}[res[0]]
+            tg_text(f"{ico} <b>نتيجة</b>: {SETUP_AR[sg['name']]} {'شراء' if sg['dir'] > 0 else 'بيع'} ({sg['grade']}) — {lab} · <b>{sg['R']:+.2f}R</b>",
+                    TELEGRAM_CHAT_ID, keyboard())
+    if changed: save_state()
+
+
+def check_price_alerts(raw):
+    if not price_alerts: return
+    price = float(raw["Close"].iloc[-1]); hit = []
+    for a in list(price_alerts):
+        if (a["dir"] == "up" and price >= a["level"]) or (a["dir"] == "down" and price <= a["level"]): hit.append(a)
+    for a in hit:
+        tg_text(f"🔔 <b>{state['focus']}</b> وصل {a['level']:.2f} (السعر الآن {price:.2f})", a["chat"], keyboard())
+        with _lock: price_alerts.remove(a)
+    if hit: save_state()
+
+
+
 # ============================== الشارت (matplotlib صافي) ==============================
-def chart_img(S, bars=70):
+def chart_img(S, bars=70, plan=None):
     d = S["d"].tail(bars)
     n = len(d); x = np.arange(n)
     bg, pan = "#0a0a0a", "#141414"
@@ -573,6 +1003,14 @@ def chart_img(S, bars=70):
         if lo - pad <= v <= hi + pad and nm not in ("VWAP", "EMA21 (15د)", "EMA50 (15د)", "بولنجر العلوي", "بولنجر السفلي"):
             ax.axhline(v, color="#8888ff", lw=.7, ls="--", alpha=.7)
             ax.text(n - 0.5, v, f" {v:.2f}", color="#aaaaff", fontsize=7, va="center")
+    if plan:
+        for nm, v, colr in (("ENTRY", plan["entry"], "#ffffff"), ("STOP", plan["stop"], "#ff3366"),
+                            ("T1", plan["t1"], "#00ff88"), ("T2", plan["t2"], "#00cc66")):
+            ax.axhline(v, color=colr, lw=1.1, ls="-." if nm != "ENTRY" else "-")
+            ax.text(n + 0.3, v, f"{nm} {v:.2f}", color=colr, fontsize=8, va="center", ha="left")
+            lo, hi = min(lo, v), max(hi, v)
+        pad = (hi - lo) * .06
+        ax.scatter([n - 1], [plan["entry"]], marker="^" if plan["dir"] > 0 else "v", s=90, color="#ffee58", zorder=5)
     ax.set_ylim(lo - pad, hi + pad)
     ax.legend(loc="upper left", fontsize=7, facecolor=pan, edgecolor="#333", labelcolor="#ddd")
     ax.set_title(f"{S['label']}  15m  {S['price']:.2f}", color="white", fontsize=11)
@@ -583,7 +1021,7 @@ def chart_img(S, bars=70):
     step = max(1, n // 8)
     axr.set_xticks(x[::step]); axr.set_xticklabels([t.strftime("%m-%d %H:%M") for t in d.index[::step]], rotation=0)
     plt.setp(ax.get_xticklabels(), visible=False); plt.setp(axv.get_xticklabels(), visible=False)
-    ax.set_xlim(-1, n + 4)
+    ax.set_xlim(-1, n + 9)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=110, bbox_inches="tight", facecolor=bg)
     plt.close(fig)
@@ -601,10 +1039,13 @@ def no_data(chat):
 
 
 def h_start(chat):
-    tg_text("<b>👋 S&P 500 Specialist v2</b>\n\n"
-            f"التركيز الحالي: <b>{state['focus']}</b>\n"
-            "اضغط زراً أو اكتب سؤالك بحرية (مثال: <i>وين أقرب دعم؟ ليش الإشارة بيع؟ وش أثر الـ VIX؟</i>)\n\n"
-            "<i>تحليل فني مبني على بيانات حية وقواعد شفافة، وليس توصية استثمارية.</i>", chat, keyboard())
+    tg_text("<b>👋 S&P 500 Specialist v3 — صائد الفرص</b>\n\n"
+            f"التركيز: <b>{state['focus']}</b> · الفريم: 15 دقيقة · الحد الأدنى للتنبيه: <b>{settings['min_grade']}</b>\n\n"
+            "أراقب كل شمعة 15د عند إغلاقها وأرسل لك الفرصة فور رصدها مع الدخول والوقف والأهداف وحكم الذكاء.\n\n"
+            "<b>الأوامر</b>\n/scan — الفرص النشطة الآن + ما يتشكل\n/stats — أداء الإشارات والباكتست\n"
+            "/alert 620 — تنبيه عند سعر\n/alerts — تنبيهاتك · /clear — حذفها\n/grade A|B|C — حدّ جودة التنبيهات\n"
+            "/backtest — إعادة قياس السيناريوهات\n/analyze /chart /levels /price /news /switch\n\n"
+            "أو اسألني بحرية.\n<i>تحليل فني آلي وليس توصية استثمارية. الأداء السابق لا يضمن المستقبل.</i>", chat, keyboard())
 
 
 def h_switch(chat):
@@ -674,14 +1115,119 @@ def h_free(chat, text):
     tg_text(fmt_ai(ans), chat, keyboard())
 
 
-ROUTES = {"start": h_start, "help": h_start, "switch": h_switch, "price": h_price, "levels": h_levels,
+def h_scan(chat):
+    S = snapshot(closed_only=True)
+    if not S: return no_data(chat)
+    d = S["d"]; P = prep(d); n = len(d); ctx = make_ctx(S)
+    sess, _ = session_info()
+    complete = sess != "open" or P["mins"][n - 1] >= 945
+    active = []
+    for k in range(3):                                     # آخر 3 شموع مغلقة
+        i = n - 1 - k
+        for sg in signals_at(P, i, ctx):
+            if walk_outcome(sg, P["High"][i + 1:], P["Low"][i + 1:], P["Close"][i + 1:], complete) is None:
+                active.append((k, sg))
+    if sess != "open": active = []
+    active.sort(key=lambda x: -x[1]["score"])
+    wl = watchlist(S, P)
+    lines = [f"🎯 <b>اقتناص {S['label']}</b> · {head(S)}"]
+    if active:
+        lines.append("\n<b>فرص نشطة</b>")
+        for k, sg in active[:4]:
+            lines.append(f"• <b>{sg['grade']} {sg['score']}</b> {SETUP_AR[sg['name']]} — {'شراء' if sg['dir'] > 0 else 'بيع'} (قبل {k * 15}د)\n"
+                         f"   دخول {sg['entry']:.2f} · وقف {sg['stop']:.2f} · هدف1 {sg['t1']:.2f} ({sg['rr1']:.1f}R) · هدف2 {sg['t2']:.2f}")
+    else:
+        lines.append("\nلا توجد فرصة نشطة تحقق الشروط الآن. الانتظار صفقة." if sess == "open" else "\nالسوق مغلق: لا فرص حية.")
+    if wl: lines.append("\n<b>قيد التشكل</b>\n" + "\n".join(html.escape(x) for x in wl))
+    brief = "\n".join(f"{sg['grade']} {SETUP_AR[sg['name']]} {'شراء' if sg['dir'] > 0 else 'بيع'} دخول {sg['entry']:.2f} وقف {sg['stop']:.2f} هدف {sg['t1']:.2f}: {'؛ '.join(sg['notes'][:3])}"
+                      for _, sg in active[:3]) or "لا فرص نشطة. قيد التشكل: " + (" | ".join(wl) if wl else "لا شيء")
+    ai = brain("بناءً على هذه القائمة (محسوبة بالكود، لا تغيّر أرقامها) أعطني توجيهاً عملياً في 3 أسطر: أي فرصة أفضّل ولماذا، "
+               "وإن لم توجد فما الذي أنتظره بالضبط (مستوى/شرط)؟\n" + brief, card_text(S, True), chat, tokens=300, memo="طلب مسح الفرص")
+    lines.append("\n🧠 " + fmt_ai(ai))
+    pl = [perf_line(sg["name"]) for _, sg in active[:1] if perf_line(sg["name"])]
+    if pl: lines.append(pl[0])
+    tg_text("\n".join(lines), chat, keyboard())
+
+
+def h_stats(chat):
+    L = ["📊 <b>الإحصائيات</b>"]
+    done = [x for x in live_sigs if x["status"] != "open"]
+    if done:
+        a = np.array([x["R"] for x in done])
+        L.append(f"\n<b>الإشارات الحية المسجّلة</b>: {len(done)} · فوز {(a > 0).mean() * 100:.0f}% · متوسط {a.mean():+.2f}R · مجموع {a.sum():+.1f}R")
+        for g in ("A", "B", "C"):
+            r = [x["R"] for x in done if x["grade"] == g]
+            if r: L.append(f"   {g}: {len(r)} · فوز {(np.array(r) > 0).mean() * 100:.0f}% · {np.mean(r):+.2f}R")
+    else:
+        L.append("\nلا توجد إشارات حية مكتملة بعد.")
+    if BT.get("stats"):
+        L.append(f"\n<b>باكتست {BT['days']} يوم ({BT['symbol']}) — شموع 15د</b>")
+        for k, v in sorted(BT["stats"].items(), key=lambda kv: -kv[1]["avgR"]):
+            pf = "∞" if v["pf"] == float("inf") else f"{v['pf']:.2f}"
+            L.append(f"• {SETUP_AR[k]}: {v['n']} · فوز {v['win'] * 100:.0f}% · {v['avgR']:+.2f}R · PF {pf}")
+        g = BT.get("grades", {})
+        if g: L.append("\nحسب الدرجة: " + " | ".join(f"{k}: {v['n']} صفقة {v['avgR']:+.2f}R" for k, v in sorted(g.items())))
+        if BT.get("all"): L.append(f"الإجمالي: {BT['all']['n']} صفقة · فوز {BT['all']['win'] * 100:.0f}% · {BT['all']['avgR']:+.2f}R للصفقة")
+        L.append("\n<i>الباكتست يفترض الدخول عند إغلاق الشمعة والخروج عند الوقف أو الهدف1 أو نهاية الجلسة، مع خصم تكلفة 0.05R. "
+                 "الاتجاه اليومي فيه سببي، لكن VIX وML غير مُضمَّنين. عيّنة 60 يوماً قصيرة: اعتبرها مؤشراً لا دليلاً.</i>")
+    else:
+        L.append("\nالباكتست لم يكتمل بعد، أرسل /backtest.")
+    tg_text("\n".join(L), chat, keyboard())
+
+
+def h_backtest(chat):
+    tg_text("⏳ أعيد قياس السيناريوهات على آخر 60 يوماً…", chat)
+    if refresh_backtest(): h_stats(chat)
+    else: tg_text("⚠️ لا بيانات كافية للباكتست الآن.", chat, keyboard())
+
+
+def h_alert(chat, arg=""):
+    m = re.search(r"\d+(?:[.,]\d+)?", arg or "")
+    if not m:
+        return tg_text("اكتب مثلاً: <code>/alert 620.5</code> وسأنبهك عند وصول السعر إليه.", chat, keyboard())
+    lvl = float(m.group().replace(",", "."))
+    raw = candles(SYMBOLS[state["focus"]], "15m", "60d")
+    if raw is None: return no_data(chat)
+    price = float(raw["Close"].iloc[-1])
+    with _lock: price_alerts.append({"level": lvl, "dir": "up" if lvl > price else "down", "chat": str(chat)})
+    save_state()
+    tg_text(f"🔔 تم. سأنبهك عندما يصل {state['focus']} إلى <b>{lvl:.2f}</b> (الآن {price:.2f}).", chat, keyboard())
+
+
+def h_alerts(chat):
+    mine = [a for a in price_alerts if a["chat"] == str(chat)]
+    tg_text("🔔 تنبيهاتك:\n" + ("\n".join(f"• {a['level']:.2f} ({'فوق' if a['dir'] == 'up' else 'تحت'})" for a in mine) or "لا يوجد."), chat, keyboard())
+
+
+def h_clear(chat):
+    with _lock: price_alerts[:] = [a for a in price_alerts if a["chat"] != str(chat)]
+    save_state(); tg_text("🗑️ تم حذف تنبيهات الأسعار.", chat, keyboard())
+
+
+def h_grade(chat, arg=""):
+    g = (arg or "").strip().upper()[:1]
+    if g not in GRADE_RANK:
+        return tg_text(f"الحد الحالي: <b>{settings['min_grade']}</b>. اكتب /grade A (قليلة وقوية) أو B (متوازنة) أو C (كثيرة).", chat, keyboard())
+    settings["min_grade"] = g; save_state()
+    tg_text(f"✅ سأرسل الفرص من درجة <b>{g}</b> فأعلى.", chat, keyboard())
+
+
+ROUTES = {"scan": h_scan, "stats": h_stats, "backtest": h_backtest, "alerts": h_alerts, "clear": h_clear, "start": h_start, "help": h_start, "switch": h_switch, "price": h_price, "levels": h_levels,
           "analyze": h_analyze, "chart": h_chart, "news": h_news}
+
+
+ARG_ROUTES = {"alert": h_alert, "grade": h_grade}
 
 
 def handle(text, chat):
     t = (text or "").strip()
-    cmd = re.sub(r"@\w+$", "", t.lstrip("/").split()[0].lower()) if t else ""
-    if (t.startswith("/") or t.lower() in ROUTES) and cmd in ROUTES:
+    parts = t.lstrip("/").split(None, 1)
+    cmd = re.sub(r"@\w+$", "", parts[0].lower()) if parts else ""
+    arg = parts[1] if len(parts) > 1 else ""
+    is_cmd = t.startswith("/") or t.lower() in ROUTES
+    if is_cmd and cmd in ARG_ROUTES:
+        return ARG_ROUTES[cmd](chat, arg)
+    if is_cmd and cmd in ROUTES:
         return ROUTES[cmd](chat)
     return h_free(chat, t)
 
@@ -727,7 +1273,7 @@ def webhook():
 @app.route("/health")
 def health():
     s, t = session_info()
-    return jsonify({"status": "ok", "bot": "tdawll-v2", "focus": state["focus"], "session": s,
+    return jsonify({"status": "ok", "bot": "tdawll-v3", "focus": state["focus"], "session": s,
                     "uptime_min": int((time.time() - _started) / 60), "time_et": now_et().strftime("%H:%M:%S")})
 
 
@@ -744,36 +1290,45 @@ def setup_webhook():
 
 
 # ============================== المراقب الآلي ==============================
+SCAN_POLL = int(os.environ.get("SCAN_POLL", "45"))
+
+
+def bt_loop():
+    time.sleep(15)
+    while True:
+        try: refresh_backtest()
+        except Exception: log.exception("backtest")
+        time.sleep(6 * 3600)
+
+
 def monitor():
     time.sleep(8)
     setup_webhook()
     if NOTIFY_STARTUP:
         tg_text(f"✅ Specialist Online | {state['focus']}", TELEGRAM_CHAT_ID, keyboard())
-    last = {"t": 0.0, "dir": 0}
-    briefed = None
+    threading.Thread(target=bt_loop, daemon=True).start()
+    last_bar, briefed = None, None
     while True:
         try:
             n = now_et(); sess, _ = session_info(n)
             if BRIEFING and n.weekday() < 5 and n.hour == 9 and n.minute < 25 and briefed != n.date():
                 briefed = n.date()
-                h_analyze(TELEGRAM_CHAT_ID, "إحاطة ما قبل الافتتاح (6 أسطر): ماذا حدث أمس، أين يقف السعر من المستويات اليومية، "
+                h_analyze(TELEGRAM_CHAT_ID, "إحاطة ما قبل الافتتاح (6 أسطر): ماذا حدث في الجلسة الماضية، أين يقف السعر من المستويات اليومية، "
                           "أهم خبر/VIX، خطة السيناريوهين (صعود/هبوط) مع شرط الإبطال.", "🌅")
-            if sess == "open":
-                S = snapshot()
-                if S and not S["stale"] and S["dir"] != 0 and abs(S["score"]) >= ALERT_SCORE:
-                    ml = S["ml"]
-                    contradicts = bool(ml and ml["reliable"] and ml["pred"] == -S["dir"])
-                    fresh = (time.time() - last["t"] > 1800) or (S["dir"] != last["dir"] and time.time() - last["t"] > 600)
-                    if fresh and not contradicts:
-                        note = brain("تنبيه آلي: في سطرين حادّين — لماذا الإشارة الآن وأين شرط الإبطال.", card_text(S, False), None, tokens=140)
-                        p = S["plan"]
-                        msg = (f"🚨 <b>{S['label']}</b> ${S['price']:.2f} — {DIR_TXT[S['dir']]} ({S['score']:+d})\n{fmt_ai(note)}\n"
-                               f"🎯 وقف {p['stop']:.2f} · هدف1 {p['t1']:.2f} · هدف2 {p['t2']:.2f}")
-                        if tg_text(msg, TELEGRAM_CHAT_ID, keyboard()):
-                            last = {"t": time.time(), "dir": S["dir"]}
+            if sess == "open" or (sess == "after" and n.hour == 16 and n.minute < 20):
+                raw = candles(SYMBOLS[state["focus"]], "15m", "60d")
+                if raw is not None and len(raw):
+                    closed = raw[raw.index + pd.Timedelta(minutes=15) <= n.replace(tzinfo=None)]
+                    check_price_alerts(raw)
+                    if len(closed):
+                        track_outcomes(closed)
+                        if sess == "open" and closed.index[-1] != last_bar:
+                            last_bar = closed.index[-1]
+                            log.info("new closed bar %s -> scan", last_bar)
+                            live_scan()
         except Exception:
             log.exception("monitor")
-        time.sleep(INTERVAL)
+        time.sleep(SCAN_POLL)
 
 
 _booted = False
@@ -781,6 +1336,7 @@ def boot():
     global _booted
     if _booted: return
     _booted = True
+    load_state()
     threading.Thread(target=monitor, daemon=True).start()
 
 
