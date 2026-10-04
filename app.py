@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-tdawll v3 — بوت تحليل S&P 500 (SPY / SPX) على تيليجرام
+tdawll v2 — بوت تحليل S&P 500 (SPY / SPX) على تيليجرام
 البيانات: Yahoo (بدون مفتاح) + Finnhub احتياطي | الذكاء: Gemini | الاستضافة: Render المجاني
 """
 import os, io, re, json, time, html, logging, threading
@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify
 from sklearn.ensemble import RandomForestClassifier
+from tda import llm, sources, agents
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -32,8 +33,6 @@ ALLOWED_CHATS = {x.strip() for x in os.environ.get("ALLOWED_CHAT_IDS", TELEGRAM_
 BRIEFING = os.environ.get("MORNING_BRIEFING", "1") == "1"     # إحاطة قبل الافتتاح
 NOTIFY_STARTUP = os.environ.get("NOTIFY_STARTUP", "0") == "1"
 AUTO_WEBHOOK = os.environ.get("AUTO_WEBHOOK", "1") == "1"
-FAST_MODELS = os.environ.get("GEMINI_FAST", "gemini-flash-lite-latest,gemini-flash-latest").split(",")
-DEEP_MODELS = os.environ.get("GEMINI_DEEP", "gemini-flash-latest,gemini-2.5-flash,gemini-flash-lite-latest").split(",")
 
 SYMBOLS = {"SPY": "SPY", "SPX": "^GSPC"}
 state = {"focus": "SPY"}
@@ -152,11 +151,27 @@ def tg_photo(img, cap, chat_id=None, kb=None):
     return False
 
 
+def tg_doc(data, name, cap, chat_id=None, kb=None):
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_TOKEN or not chat_id:
+        return False
+    try:
+        d = {"chat_id": chat_id, "caption": cap[:900], "parse_mode": "HTML"}
+        if kb: d["reply_markup"] = json.dumps(kb)
+        r = _tg("sendDocument", files={"document": (name, data, "text/html")}, data=d)
+        if r.status_code != 200: log.warning("tg_doc %s: %s", r.status_code, r.text[:150])
+        return r.status_code == 200
+    except Exception as e:
+        log.warning("tg_doc err: %s", e)
+        return False
+
+
 def keyboard():
     return {"inline_keyboard": [
         [{"text": "🎯 اقتناص الفرص", "callback_data": "scan"}, {"text": "🧠 تحليل ذكي", "callback_data": "analyze"}],
         [{"text": "📈 الشارت", "callback_data": "chart"}, {"text": "🎯 المستويات", "callback_data": "levels"}],
         [{"text": "💰 السعر", "callback_data": "price"}, {"text": "📰 الأخبار", "callback_data": "news"}],
+        [{"text": "⚖️ لجنة التداول", "callback_data": "debate"}, {"text": "🌐 المزاج والماكرو", "callback_data": "sentiment"}],
         [{"text": "📊 الإحصائيات", "callback_data": "stats"}, {"text": "🔄 SPY ⇄ SPX", "callback_data": "switch"}],
     ]}
 
@@ -498,7 +513,7 @@ def level_list(S):
 
 
 # ============================== البطاقة المُرسلة للذكاء ==============================
-def card_text(S, with_news=True):
+def card_text(S, with_news=True, ext=False):
     l, D, m = S["l"], S["D"], S["macro"]
     trend = "صاعد" if l["EMA9"] > l["EMA21"] else "هابط"
     n = now_et()
@@ -527,46 +542,30 @@ def card_text(S, with_news=True):
     if with_news:
         nw = get_news(5)
         lines.append("NEWS: " + (" || ".join(f"{x['h']} ({x['s']})" for x in nw) if nw else "لا توجد أخبار متاحة الآن"))
+    if ext:
+        lines += sources.card_lines(sources.gather("SPY"))
+    pv = pos_state["v"]
+    if pv:
+        lines.append("MY_POSITION: " + ("flat" if pv["side"] == "flat" else
+                                         f"{pv['side']} من {pv['entry']:.2f}" + (f" وقف {pv['stop']:.2f}" if pv.get("stop") else "")))
     return "\n".join(lines)
 
 
 # ============================== العقل (Gemini) ==============================
 def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
-    if not GEMINI_API_KEY:
+    if not llm.GEMINI_API_KEY:
         return "⚠️ مفتاح Gemini غير مضبوط."
     hist = chat_memory.get(chat_id, []) if chat_id else []
     contents = [{"role": "user" if m["r"] == "u" else "model", "parts": [{"text": m["c"]}]} for m in hist[-6:]]
     body = (f"[البطاقة الفنية الحية — المصدر الوحيد للأرقام]\n{card}\n\n" if card else
             "[لا توجد بيانات حية الآن. صرّح بذلك بسطر ولا تذكر أي أسعار أو مستويات محددة.]\n\n")
     contents.append({"role": "user", "parts": [{"text": body + "[المطلوب]\n" + task}]})
-
-    budget = 1024 if deep else 0
-    cfgs = [{"temperature": 0.3, "topP": 0.9, "maxOutputTokens": tokens + budget, "thinkingConfig": {"thinkingBudget": budget}},
-            {"temperature": 0.3, "topP": 0.9, "maxOutputTokens": tokens + 600}]
-    for mdl in (DEEP_MODELS if deep else FAST_MODELS):
-        for ci, cfg in enumerate(cfgs):
-            try:
-                r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{mdl.strip()}:generateContent",
-                                  headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-                                  json={"systemInstruction": {"parts": [{"text": SYSTEM}]}, "contents": contents,
-                                        "generationConfig": cfg}, timeout=45)
-                if r.status_code == 200:
-                    cd = r.json().get("candidates", [])
-                    parts = ((cd[0].get("content") or {}).get("parts", [])) if cd else []
-                    txt = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
-                    if txt:
-                        if chat_id:
-                            hist.append({"r": "u", "c": memo or task[:300]}); hist.append({"r": "a", "c": txt})
-                            chat_memory[chat_id] = hist[-12:]
-                        return txt
-                    log.warning("gemini EMPTY %s cfg%d", mdl, ci)
-                else:
-                    log.warning("gemini HTTP%s %s cfg%d: %s", r.status_code, mdl, ci, r.text[:150])
-                    if r.status_code in (429, 500, 503):
-                        time.sleep(1.2)
-                        break                       # انتقل للنموذج التالي
-            except Exception as e:
-                log.warning("gemini EXC %s: %s", mdl, str(e)[:100])
+    txt = llm.generate(SYSTEM, contents, deep=deep, tokens=tokens)
+    if txt:
+        if chat_id:
+            hist.append({"r": "u", "c": memo or task[:300]}); hist.append({"r": "a", "c": txt})
+            chat_memory[chat_id] = hist[-12:]
+        return txt
     return "❌ تعذّر توليد الإجابة (حد الاستخدام أو خلل مؤقت). جرّب بعد قليل."
 
 
@@ -581,15 +580,17 @@ REVERSAL = {"SWEEP", "DIVERGENCE", "EXHAUST", "VWAP"}
 DISABLED = {x.strip().upper() for x in os.environ.get("DISABLED_SETUPS", "").split(",") if x.strip()}
 COST_R = 0.05                                            # تكلفة افتراضية (انزلاق/عمولة) بوحدة R
 STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "/tmp"), "tdawll_state.json")
-settings = {"min_grade": os.environ.get("MIN_GRADE", "B").upper()}
-live_sigs, price_alerts, BT = [], [], {}
+settings = {"min_grade": os.environ.get("MIN_GRADE", "B").upper(), "gate": os.environ.get("AI_GATE", "soft").lower()}
+live_sigs, price_alerts, BT, lessons = [], [], {}, []
+pos_state = {"v": None}
 _lock = threading.Lock()
 
 
 def save_state():
     try:
         with _lock:
-            blob = {"live_sigs": live_sigs[-300:], "price_alerts": price_alerts, "settings": settings, "focus": state["focus"]}
+            blob = {"live_sigs": live_sigs[-300:], "price_alerts": price_alerts, "settings": settings, "focus": state["focus"],
+                    "lessons": lessons[-80:], "position": pos_state["v"]}
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(blob, f, ensure_ascii=False)
     except Exception as e:
@@ -601,6 +602,7 @@ def load_state():
         with open(STATE_FILE, encoding="utf-8") as f:
             b = json.load(f)
         live_sigs[:] = b.get("live_sigs", []); price_alerts[:] = b.get("price_alerts", [])
+        lessons[:] = b.get("lessons", []); pos_state["v"] = b.get("position")
         settings.update(b.get("settings", {})); state["focus"] = b.get("focus", state["focus"])
         log.info("state loaded: %d signals, %d alerts", len(live_sigs), len(price_alerts))
     except FileNotFoundError:
@@ -821,13 +823,18 @@ def signals_at(P, i, ctx):
     return sorted(res, key=lambda x: -x["score"])
 
 
-def walk_outcome(sg, H, L, C, complete):
+def walk_detail(sg, H, L, C, complete):
     dr = sg["dir"]
-    for h, l in zip(H, L):
-        if (l <= sg["stop"]) if dr == 1 else (h >= sg["stop"]): return "SL", -1.0 - COST_R     # عند التعارض داخل الشمعة نفترض الوقف أولاً
-        if (h >= sg["t1"]) if dr == 1 else (l <= sg["t1"]): return "TP1", sg["rr1"] - COST_R
-    if complete and len(C): return "EXP", (C[-1] - sg["entry"]) * dr / sg["risk"] - COST_R
+    for k, (h, l) in enumerate(zip(H, L)):
+        if (l <= sg["stop"]) if dr == 1 else (h >= sg["stop"]): return "SL", -1.0 - COST_R, k     # عند التعارض داخل الشمعة نفترض الوقف أولاً
+        if (h >= sg["t1"]) if dr == 1 else (l <= sg["t1"]): return "TP1", sg["rr1"] - COST_R, k
+    if complete and len(C): return "EXP", (C[-1] - sg["entry"]) * dr / sg["risk"] - COST_R, len(C) - 1
     return None
+
+
+def walk_outcome(sg, H, L, C, complete):
+    r = walk_detail(sg, H, L, C, complete)
+    return (r[0], r[1]) if r else None
 
 
 def summarize(trades):
@@ -923,6 +930,22 @@ def sig_task(sg, others):
             "(2) متى لا يجوز الدخول أو أين تُبطَل. ثم سطراً أخيراً يبدأ بـ «الحكم:» مع ✅ أو ⚠️ أو ⛔ وسبب بكلمات قليلة.")
 
 
+def active_signals(S, lookback=3):
+    """الإشارات الصالحة (لم تُحسم) على آخر `lookback` شموع مغلقة. تُستخدم في /scan و /debate."""
+    d = S["d"]; P = prep(d); n = len(d); ctx = make_ctx(S)
+    sess, _ = session_info()
+    complete = sess != "open" or P["mins"][n - 1] >= 945
+    out = []
+    if sess != "open": return out, P
+    for k in range(lookback):
+        i = n - 1 - k
+        for sg in signals_at(P, i, ctx):
+            if walk_outcome(sg, P["High"][i + 1:], P["Low"][i + 1:], P["Close"][i + 1:], complete) is None:
+                out.append((k, sg))
+    out.sort(key=lambda x: -x[1]["score"])
+    return out, P
+
+
 def live_scan(force_chat=None):
     S = snapshot(closed_only=True)
     if not S or S["stale"]: return 0
@@ -936,13 +959,52 @@ def live_scan(force_chat=None):
         if not dup: fresh.append(s)
     if not fresh: return 0
     best, others = fresh[0], fresh[1:]
-    ai = brain(sig_task(best, others), card_text(S, True), None, deep=False, tokens=260)
+
+    # لجنة التداول: ثور/دب/حكم في طلب Gemini واحد، مع دروس سابقة وموقفك الحالي
+    gate = settings.get("gate", "soft")
+    cm = None
+    if gate != "off":
+        cm = agents.committee_lite(card_text(S, True, ext=True), S["label"], best,
+                                   agents.lessons_context(lessons, best["name"]),
+                                   agents.position_context(pos_state["v"], S["price"], S["atr"]))
+    if cm:
+        best["ai_rating"], best["ai_agree"], best["ai_conf"] = cm["rating"], cm["agree"], cm["confidence"]
+    veto = bool(cm and cm["agree"] == -1)
+    if veto and gate == "hard":                            # نسجّلها لنقيس: هل كان الفيتو في محله؟
+        for x in fresh: x["sent"] = False
+        best["vetoed"] = True
+        with _lock: live_sigs.extend(fresh)
+        save_state()
+        log.info("alert vetoed by committee: %s %s", best["name"], best["dir"])
+        return 0
+    txt = signal_text(best, S, None, others)
+    if cm:
+        txt += "\n\n" + agents.lite_block(cm)
+        if veto: txt += "\n⛔ <b>اللجنة تعارض هذه الإشارة</b>: خفّض الحجم أو تجاهلها."
+    else:
+        txt += "\n\n🧠 " + fmt_ai(brain(sig_task(best, others), card_text(S, True), None, deep=False, tokens=260))
     cap = f"🎯 {S['label']} · {SETUP_AR[best['name']]} · {'شراء' if best['dir'] > 0 else 'بيع'} ({best['grade']})"
     tg_photo(chart_img(S, plan=best), cap, TELEGRAM_CHAT_ID)
-    tg_text(signal_text(best, S, ai, others), TELEGRAM_CHAT_ID, keyboard())
+    tg_text(txt, TELEGRAM_CHAT_ID, keyboard())
     with _lock: live_sigs.extend(fresh)
     save_state()
     return len(fresh)
+
+
+def _reflect_store(sg):
+    """يحوّل نتيجة صفقة محسومة إلى درس قصير يُحقن في قرارات اللجنة القادمة (ذاكرة TradingAgents)."""
+    try:
+        rec = dict(setup=sg["name"], dir=sg["dir"], grade=sg["grade"], score=sg["score"], notes=sg.get("notes", []),
+                   ai_rating=sg.get("ai_rating"), ai_agree=sg.get("ai_agree"), status=sg["status"], R=sg["R"],
+                   mfe=sg.get("mfe", 0.0), mae=sg.get("mae", 0.0), bars=sg.get("bars", 0))
+        text = agents.reflect(rec)
+        if text:
+            with _lock:
+                lessons.append({"date": str(pd.Timestamp(sg["ts"]).date()), "setup": sg["name"], "dir": sg["dir"],
+                                "grade": sg["grade"], "R": round(sg["R"], 2), "text": text})
+            save_state()
+    except Exception:
+        log.exception("reflect")
 
 
 def track_outcomes(closed):
@@ -955,13 +1017,20 @@ def track_outcomes(closed):
             if closed.index[-1].date() > ts.date(): sg["status"] = "EXP"; sg["R"] = 0.0; changed = True
             continue
         lastm = bars.index[-1].hour * 60 + bars.index[-1].minute
-        res = walk_outcome(sg, bars["High"].values, bars["Low"].values, bars["Close"].values, lastm >= 945)
+        res = walk_detail(sg, bars["High"].values, bars["Low"].values, bars["Close"].values, lastm >= 945)
         if res:
-            sg["status"], sg["R"] = res; changed = True
-            ico = "✅" if sg["R"] > 0 else "🛑"
-            lab = {"SL": "ضرب الوقف", "TP1": "تحقق الهدف1", "EXP": "إغلاق نهاية الجلسة"}[res[0]]
-            tg_text(f"{ico} <b>نتيجة</b>: {SETUP_AR[sg['name']]} {'شراء' if sg['dir'] > 0 else 'بيع'} ({sg['grade']}) — {lab} · <b>{sg['R']:+.2f}R</b>",
-                    TELEGRAM_CHAT_ID, keyboard())
+            st, R, k = res
+            Hh, Ll = bars["High"].values[:k + 1], bars["Low"].values[:k + 1]
+            fav = (Hh.max() - sg["entry"]) if sg["dir"] == 1 else (sg["entry"] - Ll.min())
+            adv = (sg["entry"] - Ll.min()) if sg["dir"] == 1 else (Hh.max() - sg["entry"])
+            sg.update(status=st, R=R, mfe=float(max(0, fav) / sg["risk"]), mae=float(-max(0, adv) / sg["risk"]), bars=int(k + 1))
+            changed = True
+            if sg.get("sent", True):
+                ico = "✅" if R > 0 else "🛑"
+                lab = {"SL": "ضرب الوقف", "TP1": "تحقق الهدف1", "EXP": "إغلاق نهاية الجلسة"}[st]
+                tg_text(f"{ico} <b>نتيجة</b>: {SETUP_AR[sg['name']]} {'شراء' if sg['dir'] > 0 else 'بيع'} ({sg['grade']}) — {lab} · <b>{R:+.2f}R</b>",
+                        TELEGRAM_CHAT_ID, keyboard())
+            pool.submit(_reflect_store, dict(sg))
     if changed: save_state()
 
 
@@ -1039,12 +1108,14 @@ def no_data(chat):
 
 
 def h_start(chat):
-    tg_text("<b>👋 S&P 500 Specialist v3 — صائد الفرص</b>\n\n"
-            f"التركيز: <b>{state['focus']}</b> · الفريم: 15 دقيقة · الحد الأدنى للتنبيه: <b>{settings['min_grade']}</b>\n\n"
-            "أراقب كل شمعة 15د عند إغلاقها وأرسل لك الفرصة فور رصدها مع الدخول والوقف والأهداف وحكم الذكاء.\n\n"
-            "<b>الأوامر</b>\n/scan — الفرص النشطة الآن + ما يتشكل\n/stats — أداء الإشارات والباكتست\n"
-            "/alert 620 — تنبيه عند سعر\n/alerts — تنبيهاتك · /clear — حذفها\n/grade A|B|C — حدّ جودة التنبيهات\n"
-            "/backtest — إعادة قياس السيناريوهات\n/analyze /chart /levels /price /news /switch\n\n"
+    tg_text("<b>👋 S&P 500 Specialist v3.1 — صائد الفرص + لجنة التداول</b>\n\n"
+            f"التركيز: <b>{state['focus']}</b> · فريم 15 دقيقة · حد التنبيه: <b>{settings['min_grade']}</b> · بوابة اللجنة: <b>{settings.get('gate', 'soft')}</b>\n\n"
+            "أراقب كل شمعة عند إغلاقها، وتنعقد لجنة (ثور/دب/حكم) على كل فرصة قبل إرسالها، وأتعلم من نتائجها.\n\n"
+            "<b>الأوامر</b>\n/scan — الفرص النشطة الآن\n/debate — لجنة كاملة (نقاش + مخاطر + قرار + تقرير HTML)\n"
+            "/sentiment — مزاج StockTwits/Reddit + احتمالات Polymarket\n/macro — FRED والأسواق التنبؤية\n"
+            "/pos long 618.5 stop 617 — أخبرني بصفقتك لأدير معك · /pos flat · /pos clear\n"
+            "/memory — الدروس التي تعلمتها من نتائجي\n/gate soft|hard|off — صرامة اللجنة على التنبيهات\n"
+            "/stats · /alert 620 · /alerts · /clear · /grade A|B|C · /backtest\n/analyze /chart /levels /price /news /switch\n\n"
             "أو اسألني بحرية.\n<i>تحليل فني آلي وليس توصية استثمارية. الأداء السابق لا يضمن المستقبل.</i>", chat, keyboard())
 
 
@@ -1079,7 +1150,7 @@ def h_analyze(chat, task=None, title="🧠"):
         return
     ans = brain(task or "اكتب تحليلاً مهنياً من 5 إلى 7 أسطر بالترتيب: (1) الصورة العامة والتعارض بين الفريمات إن وُجد "
                         "(2) الزخم والتشبع (3) أقرب دعمين ومقاومتين من البطاقة (4) السيناريو الأرجح وشرط إبطاله "
-                        "(5) ما يجب مراقبته (VIX/خبر/مستوى).", card_text(S), chat, deep=True, tokens=650, memo="طلب تحليل شامل")
+                        "(5) ما يجب مراقبته (VIX/خبر/مستوى). استخدم مزاج المتداولين والأسواق التنبؤية إن كانت متاحة.", card_text(S, True, ext=True), chat, deep=True, tokens=650, memo="طلب تحليل شامل")
     out = f"{title} {head(S)}\n📐 {DIR_TXT[S['dir']]} ({S['score']:+d}/100)\n🤖 {html.escape(ml_line(S))}\n\n{fmt_ai(ans)}"
     if S.get("plan"):
         p = S["plan"]
@@ -1111,24 +1182,15 @@ def h_news(chat):
 def h_free(chat, text):
     S = snapshot()
     ans = brain(f"سؤال المستخدم: {text}\nأجب في 2 إلى 5 أسطر إلا إذا طلب تفصيلاً. إن كان السؤال خارج نطاق السوق فاعتذر بسطر.",
-                card_text(S) if S else None, chat, deep=len(text) > 60, tokens=450, memo=text)
+                card_text(S, True, ext=True) if S else None, chat, deep=len(text) > 60, tokens=450, memo=text)
     tg_text(fmt_ai(ans), chat, keyboard())
 
 
 def h_scan(chat):
     S = snapshot(closed_only=True)
     if not S: return no_data(chat)
-    d = S["d"]; P = prep(d); n = len(d); ctx = make_ctx(S)
     sess, _ = session_info()
-    complete = sess != "open" or P["mins"][n - 1] >= 945
-    active = []
-    for k in range(3):                                     # آخر 3 شموع مغلقة
-        i = n - 1 - k
-        for sg in signals_at(P, i, ctx):
-            if walk_outcome(sg, P["High"][i + 1:], P["Low"][i + 1:], P["Close"][i + 1:], complete) is None:
-                active.append((k, sg))
-    if sess != "open": active = []
-    active.sort(key=lambda x: -x[1]["score"])
+    active, P = active_signals(S)
     wl = watchlist(S, P)
     lines = [f"🎯 <b>اقتناص {S['label']}</b> · {head(S)}"]
     if active:
@@ -1158,8 +1220,17 @@ def h_stats(chat):
         for g in ("A", "B", "C"):
             r = [x["R"] for x in done if x["grade"] == g]
             if r: L.append(f"   {g}: {len(r)} · فوز {(np.array(r) > 0).mean() * 100:.0f}% · {np.mean(r):+.2f}R")
+        grp = {1: "توافق اللجنة", 0: "محايدة", -1: "تعارض اللجنة"}
+        ai_rows = []
+        for k, lab in grp.items():
+            r = [x["R"] for x in done if x.get("ai_agree") == k]
+            if r: ai_rows.append(f"   {lab}: {len(r)} · فوز {(np.array(r) > 0).mean() * 100:.0f}% · {np.mean(r):+.2f}R")
+        if ai_rows:
+            L.append("\n<b>هل تضيف اللجنة قيمة؟</b> (الأداء حسب رأيها)\n" + "\n".join(ai_rows))
+            L.append("<i>إذا كان «تعارض اللجنة» أسوأ من «توافق» بوضوح بعد عشرات الصفقات، فاللجنة تعمل وتستحق /gate hard.</i>")
     else:
         L.append("\nلا توجد إشارات حية مكتملة بعد.")
+    L.append(f"\n🧠 دروس محفوظة: {len(lessons)} · استدعاءات Gemini منذ التشغيل: {llm.stats['calls']} (فشل {llm.stats['fail']})")
     if BT.get("stats"):
         L.append(f"\n<b>باكتست {BT['days']} يوم ({BT['symbol']}) — شموع 15د</b>")
         for k, v in sorted(BT["stats"].items(), key=lambda kv: -kv[1]["avgR"]):
@@ -1212,11 +1283,98 @@ def h_grade(chat, arg=""):
     tg_text(f"✅ سأرسل الفرص من درجة <b>{g}</b> فأعلى.", chat, keyboard())
 
 
-ROUTES = {"scan": h_scan, "stats": h_stats, "backtest": h_backtest, "alerts": h_alerts, "clear": h_clear, "start": h_start, "help": h_start, "switch": h_switch, "price": h_price, "levels": h_levels,
+def h_debate(chat, arg=""):
+    S = snapshot(closed_only=True)
+    if not S: return no_data(chat)
+    rounds = 2 if re.search(r"\b2\b", arg or "") else 1
+    tg_text(f"⚖️ تنعقد لجنة التداول على {S['label']}… (جولة {rounds}، يستغرق حوالي {20 * rounds + 15} ثانية)", chat)
+    act, _ = active_signals(S)
+    sig = act[0][1] if act else None
+    ext = sources.gather("SPY")
+    card = card_text(S, True, ext=True)
+    lines = sources.card_lines(ext, detail=True)
+    les = agents.lessons_context(lessons, sig["name"]) if sig else agents.lessons_context(lessons, "")
+    res = agents.full_debate(card, S["label"], S["price"], S["atr"], sig, les,
+                             agents.position_context(pos_state["v"], S["price"], S["atr"]), rounds=rounds)
+    sent = agents.sentiment_report(lines, get_news(8), S["label"]) if res.get("pm") else None
+    txt = agents.debate_text(res, S["label"], S["price"])
+    if sig: txt = f"🎯 على فرصة: <b>{SETUP_AR[sig['name']]}</b> ({sig['grade']}) {'شراء' if sig['dir'] > 0 else 'بيع'}\n\n" + txt
+    tg_text(txt, chat, keyboard())
+    if res.get("history") or res.get("pm"):
+        tg_doc(agents.report_html(S["label"], S["price"], res, card + "\n\n" + "\n".join(lines), sent).encode("utf-8"),
+               f"committee_{S['label']}_{now_et():%Y%m%d_%H%M}.html", "📎 تقرير اللجنة الكامل (افتحه بالمتصفح)", chat)
+
+
+def h_sentiment(chat):
+    ext = sources.gather("SPY")
+    lines = sources.card_lines(ext, detail=True)
+    rep_ = agents.sentiment_report(lines, get_news(8), state["focus"])
+    out = ["🌐 <b>المزاج والأسواق التنبؤية</b>"]
+    if rep_:
+        out.append(f"\n<b>{agents.BAND_AR.get(rep_['overall_band'], rep_['overall_band'])}</b> · {float(rep_['overall_score']):.1f}/10 · "
+                   f"{agents.CONF_AR.get(rep_.get('confidence'), '')}\n{fmt_ai(rep_['narrative'])}")
+    else:
+        out.append("\n⚠️ تعذّر توليد تقرير المزاج (Gemini). هذه البيانات الخام:")
+    out.append("\n" + html.escape("\n".join(x for x in lines if not x.startswith("  "))))
+    tg_text("\n".join(out), chat, keyboard())
+
+
+def h_macro(chat):
+    ext = sources.gather("SPY")
+    fr, pm = ext.get("fr") or {}, ext.get("pm") or {}
+    out = ["🏛️ <b>الماكرو</b>"]
+    out.append("\n<b>FRED</b>\n" + ("\n".join("• " + html.escape(x) for x in fr["rows"]) if fr.get("ok") else html.escape(fr.get("note", "غير متاح"))))
+    out.append("\n<b>Polymarket (ما تسعّره السوق للأحداث القادمة)</b>\n" +
+               ("\n".join("• " + html.escape(x) for x in pm["lines"][:6]) if pm.get("ok") else html.escape(pm.get("note", "غير متاح"))))
+    m = macro_context()
+    if m: out.append("\n<b>السوق</b>: " + " · ".join(f"{k.upper()} {v[0]:.2f} ({v[1]:+.1f}%)" for k, v in m.items()))
+    tg_text("\n".join(out), chat, keyboard())
+
+
+def h_memory(chat):
+    if not lessons:
+        return tg_text("🧠 لا دروس بعد. تُكتب تلقائياً عند حسم كل إشارة (هدف أو وقف أو نهاية جلسة).", chat, keyboard())
+    rows = [f"• <b>{x['date']}</b> {SETUP_AR.get(x['setup'], x['setup'])} {'شراء' if x['dir'] > 0 else 'بيع'} ({x['grade']}) "
+            f"<b>{x['R']:+.2f}R</b>\n  {html.escape(x['text'])}" for x in reversed(lessons[-8:])]
+    tg_text(f"🧠 <b>ذاكرة القرارات</b> ({len(lessons)} درس) — تُحقن في اللجنة القادمة\n\n" + "\n\n".join(rows), chat, keyboard())
+
+
+def h_pos(chat, arg=""):
+    a = (arg or "").strip().lower()
+    cur = pos_state["v"]
+    if not a:
+        msg = ("لم تخبرني بصفقتك." if cur is None else "أنت خارج السوق (flat)." if cur["side"] == "flat" else
+               f"صفقتك: {cur['side']} من {cur['entry']:.2f}" + (f" · وقف {cur['stop']:.2f}" if cur.get("stop") else ""))
+        return tg_text(msg + "\nالصيغة: <code>/pos long 618.5 stop 617</code> أو <code>/pos short 620</code> أو <code>/pos flat</code> أو <code>/pos clear</code>", chat, keyboard())
+    if a in ("clear", "مسح"):
+        pos_state["v"] = None; save_state(); return tg_text("🗑️ نسيتُ صفقتك (لن أفترض شيئاً عن حسابك).", chat, keyboard())
+    if a in ("flat", "off", "خارج"):
+        pos_state["v"] = {"side": "flat"}; save_state(); return tg_text("✅ مسجّل: أنت خارج السوق.", chat, keyboard())
+    m = re.match(r"(long|short|buy|sell|شراء|بيع|لونق|شورت)\s+(\d+(?:[.,]\d+)?)(?:\s+(?:stop|sl|وقف)\s*(\d+(?:[.,]\d+)?))?", a)
+    if not m:
+        return tg_text("لم أفهم. مثال: <code>/pos long 618.5 stop 617</code>", chat, keyboard())
+    side = "long" if m.group(1) in ("long", "buy", "شراء", "لونق") else "short"
+    pos_state["v"] = {"side": side, "entry": float(m.group(2).replace(",", ".")),
+                      "stop": float(m.group(3).replace(",", ".")) if m.group(3) else None}
+    save_state()
+    tg_text(f"✅ سجّلتُ صفقتك: {side} من {pos_state['v']['entry']:.2f}. ستراعيها اللجنة (احتفظ/خفّف/اخرج/حرّك الوقف).", chat, keyboard())
+
+
+def h_gate(chat, arg=""):
+    g = (arg or "").strip().lower()
+    if g not in ("soft", "hard", "off"):
+        return tg_text(f"البوابة الحالية: <b>{settings.get('gate', 'soft')}</b>\n• soft: تُرسل كل الفرص وتُوسم إن عارضتها اللجنة\n"
+                       "• hard: الفرصة التي تعارضها اللجنة لا تُرسل (لكن تُسجَّل لنقيس صحة الفيتو)\n• off: بدون لجنة على التنبيهات (يوفر حصة Gemini)",
+                       chat, keyboard())
+    settings["gate"] = g; save_state()
+    tg_text(f"✅ بوابة اللجنة: <b>{g}</b>", chat, keyboard())
+
+
+ROUTES = {"scan": h_scan, "sentiment": h_sentiment, "macro": h_macro, "memory": h_memory, "stats": h_stats, "backtest": h_backtest, "alerts": h_alerts, "clear": h_clear, "start": h_start, "help": h_start, "switch": h_switch, "price": h_price, "levels": h_levels,
           "analyze": h_analyze, "chart": h_chart, "news": h_news}
 
 
-ARG_ROUTES = {"alert": h_alert, "grade": h_grade}
+ARG_ROUTES = {"alert": h_alert, "grade": h_grade, "debate": h_debate, "pos": h_pos, "gate": h_gate}
 
 
 def handle(text, chat):
@@ -1224,7 +1382,7 @@ def handle(text, chat):
     parts = t.lstrip("/").split(None, 1)
     cmd = re.sub(r"@\w+$", "", parts[0].lower()) if parts else ""
     arg = parts[1] if len(parts) > 1 else ""
-    is_cmd = t.startswith("/") or t.lower() in ROUTES
+    is_cmd = t.startswith("/") or t.lower() in ROUTES or t.lower() in ARG_ROUTES
     if is_cmd and cmd in ARG_ROUTES:
         return ARG_ROUTES[cmd](chat, arg)
     if is_cmd and cmd in ROUTES:
@@ -1273,7 +1431,7 @@ def webhook():
 @app.route("/health")
 def health():
     s, t = session_info()
-    return jsonify({"status": "ok", "bot": "tdawll-v3", "focus": state["focus"], "session": s,
+    return jsonify({"status": "ok", "bot": "tdawll-v2", "focus": state["focus"], "session": s,
                     "uptime_min": int((time.time() - _started) / 60), "time_et": now_et().strftime("%H:%M:%S")})
 
 
