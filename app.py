@@ -40,7 +40,7 @@ SYSTEM_PROMPT = """أنت خبير تداول مالي عالمي بمستوى �
 الأنماط الكلاسيكية والحديثة، الاقتصاد الكلي، تأثير الأخبار على الأسواق، وعلم نفس التداول.
 
 أسلوبك: دقيق، مختصر، احترافي، بالعربية الفصحى المبسطة. تستخدم المصطلحات الإنجليزية بين قوسين عند الحاجة.
-تقدم تحليلاً تعليمياً وليس نصيحة مالية ملزمة. دائماً تذكر المستخدم بإدارة المخاطر."""
+تقدم تحليلاَ تعليمياً وليس نصيحة مالية ملزمة. دائماًَ تذكر المستخدم بإدارة المخاطر."""
 
 
 def tg_send_text(text, chat_id=None):
@@ -169,61 +169,62 @@ def generate_chart(sym, df):
 # ===== الدالة الذكية التي تجرّب كل النماذج المتاحة تلقائياً =====
 def ai_general_reply(user_text, chat_id):
     if not GEMINI_API_KEY:
-        return "⚠️ مفتاح Gemini غير مضبوط."
+        return "⚠️ مفتاح Gemini غير مضبوط في Render Environment Variables."
     
     history = chat_memory.get(chat_id, [])
     ctx = "\n".join([("User: "+m["content"]) if m["role"]=="user" else ("Model: "+m["content"]) for m in history[-6:]])
-    prompt = f"{SYSTEM_PROMPT}\n\nPrevious Context:\n{ctx}\n\nCurrent Question: {user_text}\nAnswer professionally in Arabic."
+    prompt = f"{SYSTEM_PROMPT}\n\nPrevious:\n{ctx}\n\nQuestion: {user_text}\nAnswer professionally in Arabic."
     
-    try:
-        # ✅ الاسم الصحيح المستخرج من قائمتك الرسمية
-        model_name = "gemini-2.5-flash" 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-        
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 800,
-                "topP": 0.95,
-                "topK": 64
-            }
-        }
-        
-        headers = {"Content-Type": "application/json"}
-        r = requests.post(url, json=payload, headers=headers, timeout=30)
-        
-        if r.status_code == 200:
-            data = r.json()
-            cand = data.get("candidates", [])
-            if cand and cand[0].get("content"):
-                parts = cand[0]["content"].get("parts", [])
-                reply = "".join([p.get("text","") for p in parts]).strip()
-                if reply:
-                    # حفظ الذاكرة
-                    history.append({"role":"user","content":user_text})
-                    history.append({"role":"assistant","content":reply})
-                    chat_memory[chat_id] = history[-20:]
-                    print(f"✅ SUCCESS using model: {model_name}")
-                    return reply
+    # قائمة النماذج المرشحة بالترتيب (الأحدث والأقوى أولاَ)
+    candidate_models = [
+        "gemini-3.8-flash",       # الأحدث والأفضل حالياَ (كما طلبت جوجل حرفياً)
+        "gemini-3.7-flash",       # بديل مستقر وقوي جداً
+        "gemini-3.6-flash",       # نسخة سابقة موثوقة
+        "gemini-3.5-flash",       # نسخة مستقرة جداَ
+        "gemini-2.5-flash",       # النسخة القديمة (قد تكون متاحة لبعض الحسابات)
+        "gemini-flash-latest",    # أحدث إصدار تلقائي
+        "gemini-pro-latest",      # أقوى نسخة تلقائية
+    ]
+    
+    last_error = ""
+    for model_name in candidate_models:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+            payload = {"contents":[{"parts":[{"text":prompt}]}],
+                       "generationConfig":{"temperature":0.7,"maxOutputTokens":800}}
+            r = requests.post(url, json=payload, headers={"Content-Type":"application/json"}, timeout=30)
             
-            return "⚠️ رد فارغ من النموذج."
+            if r.status_code == 200:
+                data = r.json()
+                cand = data.get("candidates",[])
+                if cand and cand[0].get("content"):
+                    parts = cand[0]["content"].get("parts",[])
+                    reply = "".join([p.get("text","") for p in parts]).strip()
+                    if reply:
+                        # حفظ الذاكرة فقط عند النجاح
+                        history.append({"role":"user","content":user_text})
+                        history.append({"role":"assistant","content":reply})
+                        chat_memory[chat_id] = history[-20:]
+                        print(f"✅ Used model: {model_name}")
+                        return reply
             
-        error_detail = r.text[:200]
-        print(f"❌ ERROR ({r.status_code}): {error_detail}")
-        return f"❌ خطأ من Gemini: {error_detail}"
-        
-    except Exception as e:
-        err_msg = str(e)[:100]
-        print(f"❌ EXCEPTION: {err_msg}")
-        return f"❌ فشل الاتصال: {err_msg}"
+            err_body = r.text[:150]
+            last_error = f"{model_name}: HTTP {r.status_code} - {err_body}"
+            print(f"❌ Tried {model_name} -> {last_error}")
+            
+        except Exception as e:
+            last_error = f"{model_name}: {str(e)[:80]}"
+            continue
+    
+    return f"❌ لم ينجح أي نموذج Gemini.\nآخر خطأ: {last_error[:200]}\n\n💡 تحقق من الرابط التالي لمعرفة النماذج المتاحة لديك:\nhttps://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY"
+
 
 # ===== معالجة الأوامر الذكية =====
 def handle_command(text, chat_id):
     t=text.lower().strip()
     
     if t.startswith("/start") or t=="/help":
-        return ("<b>👋 أهلاَ بك! أنا بوت التداول الخبير.</b>\n\n"
+        return ("<b>👋 أهلاً بك! أنا بوت التداول الخبير.</b>\n\n"
                 "<b>الأوامر المتاحة:</b>\n"
                 "• /analyze → تحليل فوري كامل مع خطة دخول ووقف\n"
                 "• /chart → إرسال الشارت كصورة احترافية\n"
@@ -236,7 +237,7 @@ def handle_command(text, chat_id):
     raw_df = fetch_bars_safe(SYMBOL, RESOLUTION, 200)
     
     if t.startswith("/price"):
-        if raw_df is None: return "⚠️ لا توجد بيانات (السوق قد يكون مغلقاَ)."
+        if raw_df is None: return "⚠️ لا توجد بيانات (السوق قد يكون مغلقاً)."
         return f"💰 <b>{SYMBOL}</b>: ${raw_df['Close'].iloc[-1]:.2f}"
     
     if t.startswith("/chart"):
@@ -318,7 +319,7 @@ def webhook():
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "smart-model-v8-final",
+        "bot": "smart-model-v9-final",
         "symbol": SYMBOL,
         "ai_ready": bool(GEMINI_API_KEY),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -329,7 +330,7 @@ def health():
 def monitor_loop():
     last_alert = 0
     time.sleep(8)
-    tg_send_text(f"✅ <b>Expert Bot Online (Smart Model v8)</b>\n📡 يراقب {SYMBOL} كل {CHECK_INTERVAL//60} دقيقة\nاكتب /help للأوامر")
+    tg_send_text(f"✅ <b>Expert Bot Online (Smart Model v9)</b>\n📡 يراقب {SYMBOL} كل {CHECK_INTERVAL//60} دقيقة\nاكتب /help للأوامر")
     while True:
         try:
             raw_df = fetch_bars_safe(SYMBOL, RESOLUTION, 200)
