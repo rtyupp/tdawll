@@ -24,26 +24,24 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# ⚠️ التخصيص الحصري: لا يقبل إلا SPY أو SPX
-ALLOWED_SYMBOLS = ["SPY", "^GSPC"]  # ^GSPC هو الرمز الرسمي لمؤشر S&P 500 (SPX)
+ALLOWED_SYMBOLS = ["SPY", "^GSPC"] 
 CURRENT_SYMBOL = "SPY"
 RESOLUTION = "15"
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "70"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 
-print(f"✅ Expert Bot Initialized for SPY/SPX Only")
-print(f"🔑 Keys: TG={bool(TELEGRAM_TOKEN)}, FH={bool(FINNHUB_KEY)}, GM={bool(GEMINI_API_KEY)}")
+print(f"✅ Smart Specialist Bot Initialized for SPY/SPX")
 
 chat_memory = {}
 
-# نظام تعليمات صارم للمتخصص
-SYSTEM_PROMPT = """أنت خبير تداول مالي متخصص حصرياً في مؤشرات S&P 500 (SPY ETF و ^GSPC Index). 
-قواعد الإجابة الصارمة:
-1. أجب بالعربية الفصحى المبسطة وبشكل مختصر جداً (لا تتجاوز 3 جمل قصيرة).
-2. اربط دائماً بين حركة SPY ومؤشر SPX الأصلي إذا لزم الأمر.
-3. ركز فقط على التحليل الفني القصير المدى (فريم 15 دقيقة).
-4. لا تقدم نصيحة مالية مباشرة، بل قدم قراءة فنية موضوعية.
-5. تجاهل تماماً أي سؤال عن أسهم فردية (مثل Apple أو Tesla) أو عملات رقمية، وأخبر المستخدم أنك متخصص في S&P 500 فقط."""
+# نظام تعليمات صارم للمتخصص الذكي
+SYSTEM_PROMPT = """أنت خبير تداول مالي عالمي متخصص حصرياً في S&P 500 (SPY ETF و ^GSPC Index).
+قواعد الرد الصارمة:
+1. أجب بالعربية الفصحى المبسطة وبشكل مختصر جداً (جملة أو جملتان كحد أقصى).
+2. استخدم معرفتك الداخلية للإجابة على الأسئلة النظرية (مثل ساعات التداول، التعريفات) حتى لو كان السوق مغلقاً.
+3. عند طلب التحليل الفني (/analyze, /chart)، اعتمد على البيانات المقدمة لك إن وجدت، وإلا أخبر المستخدم أن السوق مغلق حالياً واقترح عليه سؤالاً نظرياً.
+4. لا تقدم نصيحة مالية مباشرة أبداً.
+5. اربط دائماً بين حركة SPY ومؤشر SPX الأصلي."""
 
 
 def tg_send_text(text, chat_id=None):
@@ -107,8 +105,7 @@ def predict(df):
     features = ["RSI", "MACD_Hist", "EMA_9", "EMA_21", "BB_Upper", "BB_Lower", "Stoch_K", "ATR"]
     X = df[features].copy()
     for c in X.columns:
-        std_val = X[c].std()
-        mean_val = X[c].mean()
+        std_val = X[c].std(); mean_val = X[c].mean()
         X[c] = (X[c] - mean_val) / (std_val + 1e-9)
     
     future_ret = df["Close"].shift(-8) / df["Close"] - 1
@@ -129,43 +126,41 @@ def predict(df):
     return pred, probs, conf
 
 
-# ===== الذكاء المدمج: يحلل البيانات ويعطي رأياً قصيراً =====
-def get_ai_insight_on_data(sym, df, pred, conf):
-    """يقوم بتمرير الحالة الفنية الحالية للذكاء الاصطناعي ليختصرها في جملة واحدة"""
-    if not GEMINI_API_KEY or df is None: return ""
-    
-    l = df.iloc[-1]
-    trend = "صاعد" if l["EMA_9"] > l["EMA_21"] else "هابط"
-    signal_map = {1: "شراء محتمل", -1: "بيع محتمل", 0: "انتظار"}
-    current_signal = signal_map.get(pred, "انتظار")
-    
-    prompt = f"""
-    Data Snapshot for {sym} (15m chart):
-    - Price: ${l['Close']:.2f}
-    - Trend: {trend} (EMA9 vs EMA21)
-    - RSI: {l['RSI']:.1f}
-    - MACD Hist: {l['MACD_Hist']:.4f}
-    - AI Prediction: {current_signal} with {conf:.1f}% confidence.
-    
-    Task: Provide a ONE SENTENCE professional trading insight in Arabic based ONLY on this data. Be concise. Do not give financial advice, just technical observation.
+# ===== المحرك الذكي الموحد (The Unified Brain) =====
+def get_smart_response(user_query, context_data=None):
     """
+    يرسل الاستعلام والسياق إلى Gemini للحصول على إجابة ذكية ومختصرة.
+    يعمل هذا سواء للسؤال النظري أو للتحليل الفني.
+    """
+    if not GEMINI_API_KEY:
+        return "⚠️ محرك الذكاء الاصطناعي غير متاح."
+    
+    history = chat_memory.get(TELEGRAM_CHAT_ID, [])
+    ctx_str = "\n".join([("U: "+m["content"]) if m["role"]=="user" else ("A: "+m["content"]) for m in history[-4:]])
+    
+    full_prompt = f"{SYSTEM_PROMPT}\n\nConversation History:\n{ctx_str}\n\nCurrent Context Data:\n{context_data if context_data else 'None'}\n\nUser Query: {user_query}\nProvide a brief, expert response in Arabic."
     
     try:
         models_to_try = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-flash-latest"]
         for m_name in models_to_try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={GEMINI_API_KEY}"
-            payload = {"contents":[{"parts":[{"text":prompt}]}],
-                       "generationConfig":{"temperature":0.3,"maxOutputTokens":100}} # Low temp for factual brevity
+            payload = {"contents":[{"parts":[{"text":full_prompt}]}],
+                       "generationConfig":{"temperature":0.4,"maxOutputTokens":200}} 
             
-            r = requests.post(url, json=payload, headers={"Content-Type":"application/json"}, timeout=15)
+            r = requests.post(url, json=payload, headers={"Content-Type":"application/json"}, timeout=20)
             if r.status_code == 200:
                 cand = r.json().get("candidates",[])
                 if cand and cand[0].get("content"):
                     parts = cand[0]["content"].get("parts",[])
                     reply = "".join([p.get("text","") for p in parts]).strip()
-                    if reply: return reply
+                    if reply:
+                        # Update memory
+                        history.append({"role":"user","content":user_query})
+                        history.append({"role":"assistant","content":reply})
+                        chat_memory[TELEGRAM_CHAT_ID] = history[-10:]
+                        return reply
     except: pass
-    return ""
+    return "❌ تعذر توليد إجابة ذكية."
 
 
 def generate_chart(sym, df):
@@ -196,111 +191,76 @@ def handle_command(text, chat_id):
     elif any(x in t for x in ["spx", "gspc", "^gspc"]):
         target_sym = "^GSPC"
     elif t.startswith("/switch"):
-        # أمر تبديل يدوي آمن
         if "spx" in t or "index" in t: target_sym = "^GSPC"
         else: target_sym = "SPY"
     else:
-        target_sym = CURRENT_SYMBOL # افتراضي
+        target_sym = CURRENT_SYMBOL
     
-    # منع الرموز غير المصرح بها
     if target_sym not in ALLOWED_SYMBOLS:
-        return "⛔ أنا متخصص فقط في S&P 500 (SPY/Index). لا أدعم رموزاً أخرى."
+        return "⛔ أنا متخصص فقط في S&P 500 (SPY/Index)."
     
     CURRENT_SYMBOL = target_sym
     display_name = "SPY" if target_sym == "SPY" else "SPX (^GSPC)"
 
     if t.startswith("/start") or t=="/help":
         return ("<b>👋 S&P 500 Specialist Bot</b>\n\n"
-                "<b>Current Focus:</b> {}\n"
+                "<b>Focus:</b> {}\n"
                 "<b>Commands:</b>\n"
-                "• /analyze → تحليل فني + رأي ذكي مختصر\n"
-                "• /chart → شارت احترافي مع تعليقات\n"
+                "• /analyze → تحليل فني ذكي\n"
+                "• /chart → شارت مع تعليق\n"
                 "• /price → السعر الحالي\n"
                 "• /switch spy | /switch spx → تغيير التركيز\n"
-                "• سؤال عادي → إجابة متخصصة ومختصرة\n\n"
-                "<i>متخصص حصرياً في مؤشر S&P 500.</i>").format(display_name)
+                "• أي سؤال → إجابة خبيرة مختصرة\n").format(display_name)
     
     raw_df = fetch_bars_safe(CURRENT_SYMBOL, RESOLUTION, 200)
     
     if t.startswith("/price"):
-        if raw_df is None: return f"⚠️ لا توجد بيانات لـ {display_name} (السوق مغلق؟)."
+        if raw_df is None: 
+            # حتى لو السوق مغلق، نستخدم الذكاء للجواب بشكل لطيف
+            return get_smart_response(f"What is the current price of {display_name}? Market seems closed.", None)
         return f"💰 <b>{display_name}</b>: ${raw_df['Close'].iloc[-1]:.2f}"
     
     if t.startswith("/chart"):
         ind_df = compute_indicators(raw_df)
-        if ind_df is None: return "⚠️ لا توجد بيانات لرسم الشارت."
+        if ind_df is None: 
+             return get_smart_response(f"I tried to draw a chart for {display_name} but market is closed. Can you explain what I would typically look for?", None)
         
-        # توليد الصورة
         img = generate_chart(CURRENT_SYMBOL, ind_df)
         if img is None: return "⚠️ تعذر توليد الصورة."
         
-        # جلب الرأي الذكي المختصر لإضافته للكابشن
         pred, _, conf = predict(ind_df)
-        ai_note = get_ai_insight_on_data(display_name, ind_df, pred, conf)
+        l = ind_df.iloc[-1]
+        tech_summary = f"Price:${l['Close']:.2f}|RSI:{l['RSI']:.1f}|Trend:{'Up' if l['EMA_9']>l['EMA_21'] else 'Down'}|Signal:{pred}"
         
-        cap = f"📊 <b>{display_name} Chart</b>\n${ind_df['Close'].iloc[-1]:.2f} | RSI {ind_df['RSI'].iloc[-1]:.1f}\n\n💡 <i>{ai_note}</i>" if ai_note else f"📊 <b>{display_name} Chart</b>\n${ind_df['Close'].iloc[-1]:.2f}"
+        ai_caption = get_smart_response(f"Summarize this technical snapshot for {display_name} in one sentence:", tech_summary)
+        
+        cap = f"📊 <b>{display_name} Chart</b>\n${ind_df['Close'].iloc[-1]:.2f} | RSI {ind_df['RSI'].iloc[-1]:.1f}\n\n💡 <i>{ai_caption}</i>"
         
         tg_send_photo(img, cap, chat_id=chat_id)
         return None 
     
     if t.startswith("/analyze"):
         ind_df = compute_indicators(raw_df)
-        if ind_df is None: return "⚠️ لا توجد بيانات للتحليل."
+        if ind_df is None: 
+             return get_smart_response(f"Analyze {display_name}. Since market is closed, give me general advice on watching it.", None)
         
         pred, probs, conf = predict(ind_df)
         l = ind_df.iloc[-1]
         
-        # بناء التقرير الأساسي
-        smap={1:"🟢 شراء",-1:"🔴 بيع",0:"⚪ انتظار"}
-        trnd="صاعد 📈" if l["EMA_9"]>l["EMA_21"] else "هابط 📉"
+        smap={1:"BUY",-1:"SELL",0:"WAIT"}
+        trnd="UP" if l["EMA_9"]>l["EMA_21"] else "DOWN"
         
-        base_report = (f"<b>🧠 Analysis: {display_name}</b>\n"
-                       f"Price: ${l['Close']:.2f} | Trend: {trnd}\n"
-                       f"Signal: {smap.get(pred,'⚪')} ({conf:.1f}%)\n"
-                       f"RSI: {l['RSI']:.1f} | MACD H: {l['MACD_Hist']:.4f}")
+        tech_snapshot = f"Symbol:{display_name}|Price:${l['Close']:.2f}|Trend:{trnd}|RSI:{l['RSI']:.1f}|MACD_H:{l['MACD_Hist']:.4f}|AI_Signal:{smap.get(pred,'WAIT')} ({conf:.0f}%)"
         
-        # إضافة اللمسة الذكية المدمجة
-        ai_note = get_ai_insight_on_data(display_name, ind_df, pred, conf)
-        final_msg = base_report + (f"\n\n💬 <b>Expert Insight:</b>\n{ai_note}" if ai_note else "")
+        final_analysis = get_smart_response(f"Give me a professional trading insight based on this data:", tech_snapshot)
         
-        return final_msg
-    
+        return f"<b>🧠 Analysis: {display_name}</b>\n\n{final_analysis}"
+        
     if t.startswith("/switch"):
-        return f"✅ Switched focus to: {display_name}. Use /analyze or /chart now."
+        return f"✅ Switched focus to: {display_name}."
         
-    # الأسئلة العامة (مختصرة وذكية)
-    return ask_expert_question(text, chat_id, display_name)
-
-
-def ask_expert_question(user_text, chat_id, sym_display):
-    if not GEMINI_API_KEY:
-        return "⚠️ محرك الذكاء الاصطناعي غير متاح حالياً."
-    
-    history = chat_memory.get(chat_id, [])
-    ctx = "\n".join([("U: "+m["content"]) if m["role"]=="user" else ("A: "+m["content"]) for m in history[-4:]])
-    
-    prompt = f"{SYSTEM_PROMPT}\nContext:\n{ctx}\nUser asks about {sym_display}: {user_text}\nAnswer briefly in Arabic."
-    
-    try:
-        models_to_try = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-flash-latest"]
-        for m_name in models_to_try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={GEMINI_API_KEY}"
-            payload = {"contents":[{"parts":[{"text":prompt}]}],
-                       "generationConfig":{"temperature":0.4,"maxOutputTokens":250}} # Strict brevity
-            
-            r = requests.post(url, json=payload, headers={"Content-Type":"application/json"}, timeout=20)
-            if r.status_code == 200:
-                cand = r.json().get("candidates",[])
-                if cand and cand[0].get("content"):
-                    parts = cand[0]["content"].get("parts",[])
-                    reply = "".join([p.get("text","") for p in parts]).strip()
-                    if reply:
-                        history.append({"role":"user","content":user_text})
-                        history.append({"role":"assistant","content":reply})
-                        chat_memory[chat_id] = history[-10:]
-                        return reply
-    except: pass
-    return "❌ تعذر الحصول على إجابة ذكية."
+    # الأسئلة العامة تمر عبر العقل المدبر مباشرة
+    return get_smart_response(text, None)
 
 
 @app.route("/webhook", methods=["POST"])
@@ -322,12 +282,12 @@ def webhook():
 @app.route("/")
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok","bot":"SPY_SPX_Specialist_v10","focus":CURRENT_SYMBOL,"time":datetime.now().strftime("%H:%M:%S")})
+    return jsonify({"status":"ok","bot":"Smart_SPY_SPX_v11","focus":CURRENT_SYMBOL,"time":datetime.now().strftime("%H:%M:%S")})
 
 
 def monitor_loop():
     la=0; time.sleep(8)
-    tg_send_text(f"✅ S&P 500 Specialist Online\nFocus: {CURRENT_SYMBOL}\n/help for commands")
+    tg_send_text(f"✅ Smart Specialist Online\nFocus: {CURRENT_SYMBOL}\nAsk anything!")
     while True:
         try:
             raw=fetch_bars_safe(CURRENT_SYMBOL, RESOLUTION, 200)
@@ -336,9 +296,8 @@ def monitor_loop():
                 if ind is not None and len(ind)>=30:
                     p,pr,c=predict(ind);now=time.time()
                     if p!=0 and c>=MIN_CONFIDENCE and (now-la)>1800:
-                        # تنبيه ذكي مختصر
-                        note = get_ai_insight_on_data(CURRENT_SYMBOL, ind, p, c)
-                        txt = f"🚨 <b>{CURRENT_SYMBOL} Alert</b>\nSignal: {'BUY' if p==1 else 'SELL'} ({c:.0f}%)\n💬 {note}"
+                        note = get_smart_response(f"Alert triggered for {CURRENT_SYMBOL}. Signal: {'BUY' if p==1 else 'SELL'}. Confidence: {c}%. Give me a 1-sentence alert reason.", None)
+                        txt = f"🚨 <b>{CURRENT_SYMBOL} Alert</b>\n{note}"
                         if tg_send_text(txt): la=now
         except Exception as e: print(f"MonErr:{e}")
         time.sleep(CHECK_INTERVAL)
