@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
+# ===== المتغيرات من Render Secrets =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY")
@@ -25,17 +26,17 @@ RES = "15"
 MIN_CONF = int(os.environ.get("MIN_CONFIDENCE", "70"))
 INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 
-chat_memory = {}  # يُصحّح: مفتاحه chat_id الفعلي
+chat_memory = {}  # مفتاحه chat_id الفعلي لكل مستخدم
 
-# 🎯 الـ Prompt الصارم: متداول محترف، لا خطيب
+# نظام تعليمات صارم: متداول محترف لا خطيب
 SYSTEM = """أنت متداول مؤسسي محترف على S&P 500 (SPY/^GSPC).
 قواعدك الحديدية:
-- أجب بالعربية بأسلوب متداول حقيقي، لا بأسلوب أكاديمي أو إنشائي.
-- اختصر جداً: 2-4 أسطر كحد أقصى إلا إذا طُلب تفصيل.
-- ابنِ حكمك على الأرقام المعطاة لك فقط، لا تختلق أرقاماً.
+- أجب بالعربية بأسلوب حاد ومباشر كمتداول حقيقي.
+- اختصر جداً: 2-4 أسطر كحد أقصى إلا إذا طُلب تفصيل صريح.
+- ابنِ حكمك على الأرقام المعطاة لك فقط، لا تختلق أرقاماَ.
 - استخدم مصطلحات التداول الحقيقية: تشبع، اختراق، ارتداد، سيولة، اتجاه، وقف، هدف.
 - لا تقل أبداً 'أنصحك بالشراء'، قل 'الفنّي يرجّح...' أو 'الإعدادية أفضل لـ...'.
-- إذا لم تتوفر بيانات حية، اعتمد على خبرتك واذكر أن السوق مغلق."""
+- إذا لم تتوفر بيانات حية، اعتمد على خبرتك واذكر أن السوق مغلق حالياً."""
 
 
 def tg_text(text, chat_id=None, kb=None):
@@ -46,7 +47,9 @@ def tg_text(text, chat_id=None, kb=None):
         if kb: d["reply_markup"] = json.dumps(kb)
         return requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                              data=d, timeout=15).status_code == 200
-    except: return False
+    except Exception as e:
+        print(f"TgSendErr: {e}")
+        return False
 
 def tg_photo(img, cap, chat_id=None, kb=None):
     chat_id = chat_id or TELEGRAM_CHAT_ID
@@ -56,7 +59,9 @@ def tg_photo(img, cap, chat_id=None, kb=None):
         if kb: d["reply_markup"] = json.dumps(kb)
         return requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
                              files={"photo": ("c.png", img, "image/png")}, data=d, timeout=30).status_code == 200
-    except: return False
+    except Exception as e:
+        print(f"TgPhotoErr: {e}")
+        return False
 
 
 def fetch(symbol, res="15", n=200):
@@ -67,7 +72,9 @@ def fetch(symbol, res="15", n=200):
         if j.get("s") != "ok" or not j.get("c"): return None
         return pd.DataFrame({"Open":j["o"],"High":j["h"],"Low":j["l"],"Close":j["c"],"Volume":j["v"]},
                             index=pd.to_datetime(j["t"], unit="s"))
-    except: return None
+    except Exception as e:
+        print(f"FetchErr {symbol}: {e}")
+        return None
 
 def indicators(df):
     if df is None or len(df) < 20: return None
@@ -97,7 +104,7 @@ def predict(df):
     return p, float(max(pr)*100)
 
 
-# 🧠 البطاقة الفنية: هذا ما يحوّل الغباء لذكاء
+# البطاقة الفنية: تغذية النموذج بالأرقام الحقيقية بدل الكلام العام
 def market_card(sym, df, pred, conf):
     l = df.iloc[-1]
     trend = "صاعد" if l["EMA9"] > l["EMA21"] else "هابط"
@@ -109,30 +116,50 @@ def market_card(sym, df, pred, conf):
             f"MODEL_SIGNAL={sig} CONF={conf:.0f}%")
 
 
-# 🤖 العقل: يُطعَم البطاقة لا سؤالاً فارغاً
-def brain(task, card=None, chat_id=None, tokens=220):
+# العقل المدبر مع تعطيل التفكير الداخلي لضمان إجابة فورية
+def brain(task, card=None, chat_id=None, tokens=2048):
     if not GEMINI_API_KEY: return "⚠️ مفتاح Gemini غير مضبوط."
     hist = chat_memory.get(chat_id, []) if chat_id else []
     ctx = "\n".join([("س: "+m["c"]) if m["r"]=="u" else ("ج: "+m["c"]) for m in hist[-4:]])
     data_block = f"\n[بيانات فنية حية]\n{card}\n" if card else ""
     prompt = f"{SYSTEM}\n\n[سياق سابق]\n{ctx}\n{data_block}\n[المطلوب]\n{task}"
-    for mdl in ["gemini-flash-latest","gemini-2.5-flash"]:
-        try:
-            u = f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent?key={GEMINI_API_KEY}"
-            pl = {"contents":[{"parts":[{"text":prompt}]}],
-                  "generationConfig":{"temperature":0.35,"maxOutputTokens":tokens,"topP":0.9,"topK":50}}
-            r = requests.post(u, json=pl, headers={"Content-Type":"application/json"}, timeout=25)
-            if r.status_code == 200:
-                cd = r.json().get("candidates",[])
-                if cd and cd[0].get("content"):
-                    txt = "".join([p.get("text","") for p in cd[0]["content"].get("parts",[])]).strip()
-                    if txt:
-                        if chat_id:
-                            hist.append({"r":"u","c":task}); hist.append({"r":"a","c":txt})
-                            chat_memory[chat_id] = hist[-10:]
-                        return txt
-        except: continue
-    return "❌ تعذّر توليد الإجابة."
+
+    # إعدادان: الأول يعطل التفكير كلياَ (الأهم)، الثاني احتياطي
+    configs = [
+        {"temperature":0.3,"maxOutputTokens":tokens,"topP":0.9,"topK":50,
+         "thinkingConfig":{"thinkingBudget":0}},
+        {"temperature":0.3,"maxOutputTokens":tokens,"topP":0.9,"topK":50},
+    ]
+    models = ["gemini-flash-lite-latest","gemini-flash-latest","gemini-2.5-flash"]
+
+    for mdl in models:
+        for ci,cfg in enumerate(configs):
+            try:
+                u = f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent?key={GEMINI_API_KEY}"
+                pl = {"contents":[{"parts":[{"text":prompt}]}],"generationConfig":cfg}
+                r = requests.post(u, json=pl, headers={"Content-Type":"application/json"}, timeout=30)
+                if r.status_code == 200:
+                    j = r.json()
+                    cd = j.get("candidates",[])
+                    if cd:
+                        fr = cd[0].get("finishReason","")
+                        parts = (cd[0].get("content") or {}).get("parts",[])
+                        # نستبعد أجزاء التفكير الداخلي ولا نجمعها كإجابة
+                        txt = "".join([p.get("text","") for p in parts if not p.get("thought")]).strip()
+                        if txt:
+                            if chat_id:
+                                hist.append({"r":"u","c":task}); hist.append({"r":"a","c":txt})
+                                chat_memory[chat_id] = hist[-10:]
+                            print(f"✅ OK {mdl} cfg{ci} finish={fr}")
+                            return txt
+                        print(f"⚠️ EMPTY {mdl} cfg{ci} finish={fr} parts={len(parts)}")
+                    else:
+                        print(f"⚠️ NO_CAND {mdl} cfg{ci} {str(j)[:180]}")
+                else:
+                    print(f"❌ HTTP{r.status_code} {mdl} cfg{ci}: {r.text[:180]}")
+            except Exception as e:
+                print(f"❌ EXC {mdl}: {str(e)[:120]}")
+    return "❌ تعذّر توليد الإجابة — افتح Render Logs."
 
 
 def chart_img(sym, df):
@@ -171,7 +198,7 @@ def dispatch(cmd, chat_id):
     if c in ("start","help","cmd_help") or c.startswith("/start") or c.startswith("/help"):
         return ("<b>👋 S&P 500 Specialist</b>\n\n"
                 f"التركيز: <b>{disp}</b>\n"
-                "اضغط زرّاً أو اسألني أي شيء عن المؤشر.\n"
+                "اضغط زرّاَ أو اسألني أي شيء عن المؤشر.\n"
                 "<i>أجيب كأحد المتداولين، لا كخطيب.</i>"), keyboard()
 
     if c.startswith("/switch") or c=="switch":
@@ -245,7 +272,7 @@ def webhook():
 @app.route("/")
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok","bot":"pro-trader-v13","focus":CURRENT,"time":datetime.now().strftime("%H:%M:%S")})
+    return jsonify({"status":"ok","bot":"pro-trader-v14-no-think","focus":CURRENT,"time":datetime.now().strftime("%H:%M:%S")})
 
 
 def monitor():
