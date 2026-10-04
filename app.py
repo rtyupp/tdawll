@@ -34,25 +34,35 @@ print(f"✅ Smart Specialist Bot Initialized for SPY/SPX")
 
 chat_memory = {}
 
-# نظام تعليمات صارم للمتخصص الذكي
-SYSTEM_PROMPT = """أنت خبير تداول مالي عالمي متخصص حصرياً في S&P 500 (SPY ETF و ^GSPC Index).
-قواعد الرد الصارمة:
-1. أجب بالعربية الفصحى المبسطة وبشكل مختصر جداً (جملة أو جملتان كحد أقصى).
-2. استخدم معرفتك الداخلية للإجابة على الأسئلة النظرية (مثل ساعات التداول، التعريفات) حتى لو كان السوق مغلقاً.
-3. عند طلب التحليل الفني (/analyze, /chart)، اعتمد على البيانات المقدمة لك إن وجدت، وإلا أخبر المستخدم أن السوق مغلق حالياً واقترح عليه سؤالاً نظرياً.
-4. لا تقدم نصيحة مالية مباشرة أبداً.
-5. اربط دائماً بين حركة SPY ومؤشر SPX الأصلي."""
+# نظام تعليمات مرن وذكي (بدون قيود طول صارمة)
+SYSTEM_PROMPT = """أنت خبير تداول مالي عالمي متخصص حصرياُ في S&P 500 (SPY ETF و ^GSPC Index).
+
+قواعد التفاعل:
+1. كن ذكياً وغنياً بالمعلومات. لا تختصر إلا إذا كان السؤال بسيطاً جداً.
+2. اشرح المفاهيم المعقدة بوضوح وبأمثلة عملية مرتبطة بالسوق الأمريكي.
+3. عند تحليل البيانات الفنية، قدم قراءة احترافية تربط بين المؤشرات (RSI, MACD, EMA) وسياق السوق العام.
+4. استخدم العربية الفصحى المبسطة مع المصطلحات الإنجليزية بين قوسين عند الضرورة.
+5. لا تقدم نصيحة مالية مباشرة ("اشترِ الآن")، بل قدم رؤى تحليلية ("البيانات تشير إلى...").
+6. كن ودوداً ومتحمساً لمساعدة المستخدم على فهم الأسواق بشكل أفضل."""
 
 
-def tg_send_text(text, chat_id=None):
+def tg_send_text(text, chat_id=None, reply_markup=None):
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_TOKEN or not chat_id: return False
     try:
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup) # Need to import json
+        
         r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                          data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
+                          data=data, timeout=15)
         return r.status_code == 200
-    except: return False
+    except Exception as e:
+        print(f"Telegram send error: {e}")
+        return False
 
+# Import json here since we use it above
+import json 
 
 def tg_send_photo(photo_bytes, caption, chat_id=None):
     chat_id = chat_id or TELEGRAM_CHAT_ID
@@ -127,9 +137,9 @@ def predict(df):
 
 
 # ===== المحرك الذكي الموحد (The Unified Brain) =====
-def get_smart_response(user_query, context_data=None):
+def get_ai_response(prompt_text, context_data=None):
     """
-    يرسل الاستعلام والسياق إلى Gemini للحصول على إجابة ذكية ومختصرة.
+    يرسل الاستعلام والسياق إلى Gemini للحصول على إجابة ذكية ومفصلة.
     يعمل هذا سواء للسؤال النظري أو للتحليل الفني.
     """
     if not GEMINI_API_KEY:
@@ -138,14 +148,14 @@ def get_smart_response(user_query, context_data=None):
     history = chat_memory.get(TELEGRAM_CHAT_ID, [])
     ctx_str = "\n".join([("U: "+m["content"]) if m["role"]=="user" else ("A: "+m["content"]) for m in history[-4:]])
     
-    full_prompt = f"{SYSTEM_PROMPT}\n\nConversation History:\n{ctx_str}\n\nCurrent Context Data:\n{context_data if context_data else 'None'}\n\nUser Query: {user_query}\nProvide a brief, expert response in Arabic."
+    full_prompt = f"{SYSTEM_PROMPT}\n\nConversation History:\n{ctx_str}\n\nCurrent Context Data:\n{context_data if context_data else 'None'}\n\nUser Query: {prompt_text}\nProvide a comprehensive, expert response in Arabic."
     
     try:
-        models_to_try = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-flash-latest"]
+        models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
         for m_name in models_to_try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={GEMINI_API_KEY}"
             payload = {"contents":[{"parts":[{"text":full_prompt}]}],
-                       "generationConfig":{"temperature":0.4,"maxOutputTokens":200}} 
+                       "generationConfig":{"temperature":0.7,"maxOutputTokens":1024}} 
             
             r = requests.post(url, json=payload, headers={"Content-Type":"application/json"}, timeout=20)
             if r.status_code == 200:
@@ -155,7 +165,7 @@ def get_smart_response(user_query, context_data=None):
                     reply = "".join([p.get("text","") for p in parts]).strip()
                     if reply:
                         # Update memory
-                        history.append({"role":"user","content":user_query})
+                        history.append({"role":"user","content":prompt_text})
                         history.append({"role":"assistant","content":reply})
                         chat_memory[TELEGRAM_CHAT_ID] = history[-10:]
                         return reply
@@ -202,28 +212,38 @@ def handle_command(text, chat_id):
     CURRENT_SYMBOL = target_sym
     display_name = "SPY" if target_sym == "SPY" else "SPX (^GSPC)"
 
+    # --- إنشاء لوحة الأزرار الجميلة بالعربي ---
+    keyboard_menu = {
+        "inline_keyboard": [
+            [{"text": "📊 تحليل فوري", "callback_data": "cmd_analyze"}],
+            [{"text": "📈 رسم الشارت", "callback_data": "cmd_chart"}],
+            [{"text": "💰 السعر الحالي", "callback_data": "cmd_price"}],
+            [{"text": "🔄 تبديل الرمز", "callback_data": "cmd_switch"}],
+            [{"text": "ℹ️ المساعدة", "callback_data": "cmd_help"}]
+        ]
+    }
+
     if t.startswith("/start") or t=="/help":
-        return ("<b>👋 S&P 500 Specialist Bot</b>\n\n"
-                "<b>Focus:</b> {}\n"
-                "<b>Commands:</b>\n"
-                "• /analyze → تحليل فني ذكي\n"
-                "• /chart → شارت مع تعليق\n"
-                "• /price → السعر الحالي\n"
-                "• /switch spy | /switch spx → تغيير التركيز\n"
-                "• أي سؤال → إجابة خبيرة مختصرة\n").format(display_name)
+        msg = ("<b>👋 أهلاً بك في بوت S&P 500 الخبير!</b>\n\n"
+               "<b>التركيز الحالي:</b> {}\n\n"
+               "استخدم الأزرار أدناه للتفاعل بسهولة.".format(display_name))
+        # نرسل الرسالة مع الأزرار مباشرة عبر الدالة المعدلة
+        tg_send_text(msg, chat_id=chat_id, reply_markup=keyboard_menu)
+        return None # لأننا أرسلنا الرسالة بالفعل
     
     raw_df = fetch_bars_safe(CURRENT_SYMBOL, RESOLUTION, 200)
     
     if t.startswith("/price"):
         if raw_df is None: 
-            # حتى لو السوق مغلق، نستخدم الذكاء للجواب بشكل لطيف
-            return get_smart_response(f"What is the current price of {display_name}? Market seems closed.", None)
+            ans = get_ai_response(f"What is the current price of {display_name}? Market seems closed.", None)
+            return f"<b>💰 حالة السعر:</b>\n{ans}"
         return f"💰 <b>{display_name}</b>: ${raw_df['Close'].iloc[-1]:.2f}"
     
     if t.startswith("/chart"):
         ind_df = compute_indicators(raw_df)
         if ind_df is None: 
-             return get_smart_response(f"I tried to draw a chart for {display_name} but market is closed. Can you explain what I would typically look for?", None)
+             ans = get_ai_response(f"I tried to draw a chart for {display_name} but market is closed. Can you explain what I would typically look for?", None)
+             return f"<b>📈 وضع الشارت:</b>\n{ans}"
         
         img = generate_chart(CURRENT_SYMBOL, ind_df)
         if img is None: return "⚠️ تعذر توليد الصورة."
@@ -232,7 +252,7 @@ def handle_command(text, chat_id):
         l = ind_df.iloc[-1]
         tech_summary = f"Price:${l['Close']:.2f}|RSI:{l['RSI']:.1f}|Trend:{'Up' if l['EMA_9']>l['EMA_21'] else 'Down'}|Signal:{pred}"
         
-        ai_caption = get_smart_response(f"Summarize this technical snapshot for {display_name} in one sentence:", tech_summary)
+        ai_caption = get_ai_response(f"Summarize this technical snapshot for {display_name} professionally:", tech_summary)
         
         cap = f"📊 <b>{display_name} Chart</b>\n${ind_df['Close'].iloc[-1]:.2f} | RSI {ind_df['RSI'].iloc[-1]:.1f}\n\n💡 <i>{ai_caption}</i>"
         
@@ -242,7 +262,8 @@ def handle_command(text, chat_id):
     if t.startswith("/analyze"):
         ind_df = compute_indicators(raw_df)
         if ind_df is None: 
-             return get_smart_response(f"Analyze {display_name}. Since market is closed, give me general advice on watching it.", None)
+             ans = get_ai_response(f"Analyze {display_name}. Since market is closed, give me general advice on watching it.", None)
+             return f"<b>🧠 التحليل:</b>\n{ans}"
         
         pred, probs, conf = predict(ind_df)
         l = ind_df.iloc[-1]
@@ -252,7 +273,7 @@ def handle_command(text, chat_id):
         
         tech_snapshot = f"Symbol:{display_name}|Price:${l['Close']:.2f}|Trend:{trnd}|RSI:{l['RSI']:.1f}|MACD_H:{l['MACD_Hist']:.4f}|AI_Signal:{smap.get(pred,'WAIT')} ({conf:.0f}%)"
         
-        final_analysis = get_smart_response(f"Give me a professional trading insight based on this data:", tech_snapshot)
+        final_analysis = get_ai_response(f"Give me a professional trading insight based on this data:", tech_snapshot)
         
         return f"<b>🧠 Analysis: {display_name}</b>\n\n{final_analysis}"
         
@@ -260,16 +281,39 @@ def handle_command(text, chat_id):
         return f"✅ Switched focus to: {display_name}."
         
     # الأسئلة العامة تمر عبر العقل المدبر مباشرة
-    return get_smart_response(text, None)
+    return get_ai_response(text, None)
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(force=True, silent=True) or {}
+    
+    # التعامل مع ضغط الأزرار (Callback Queries)
+    callback_query = data.get("callback_query")
+    if callback_query:
+        chat_id = callback_query["message"]["chat"]["id"]
+        cmd = callback_query["data"]
+        user_text_map = {
+            "cmd_analyze": "/analyze",
+            "cmd_chart": "/chart",
+            "cmd_price": "/price",
+            "cmd_switch": "/switch spy", # Default switch to SPY
+            "cmd_help": "/help"
+        }
+        mapped_text = user_text_map.get(cmd, "")
+        if mapped_text:
+            reply = handle_command(mapped_text, chat_id)
+            if reply: tg_send_text(reply, chat_id=chat_id)
+        # Send ACK to Telegram to stop loading spinner
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery?callback_query_id={callback_query['id']}")
+        return jsonify({"ok": True})
+
+    # التعامل مع الرسائل النصية العادية
     msg = data.get("message", {})
     chat_id = msg.get("chat", {}).get("id")
     text = msg.get("text", "")
     if not chat_id or not text: return jsonify({"ok": True})
+    
     try:
         reply = handle_command(text, chat_id)
         if reply: tg_send_text(reply, chat_id=chat_id)
@@ -282,7 +326,7 @@ def webhook():
 @app.route("/")
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok","bot":"Smart_SPY_SPX_v11","focus":CURRENT_SYMBOL,"time":datetime.now().strftime("%H:%M:%S")})
+    return jsonify({"status":"ok","bot":"Smart_SPY_SPX_v12_FriendlyUI","focus":CURRENT_SYMBOL,"time":datetime.now().strftime("%H:%M:%S")})
 
 
 def monitor_loop():
@@ -296,7 +340,7 @@ def monitor_loop():
                 if ind is not None and len(ind)>=30:
                     p,pr,c=predict(ind);now=time.time()
                     if p!=0 and c>=MIN_CONFIDENCE and (now-la)>1800:
-                        note = get_smart_response(f"Alert triggered for {CURRENT_SYMBOL}. Signal: {'BUY' if p==1 else 'SELL'}. Confidence: {c}%. Give me a 1-sentence alert reason.", None)
+                        note = get_ai_response(f"Alert triggered for {CURRENT_SYMBOL}. Signal: {'BUY' if p==1 else 'SELL'}. Confidence: {c}%. Give me a detailed alert reason.", None)
                         txt = f"🚨 <b>{CURRENT_SYMBOL} Alert</b>\n{note}"
                         if tg_send_text(txt): la=now
         except Exception as e: print(f"MonErr:{e}")
