@@ -4,7 +4,7 @@ pandas
 numpy
 scikit-learn
 ta
-groq
-gunicorn==21.2.0
 matplotlib
 mplfinance
+gunicorn==21.2.0
+google-generativeai
