@@ -3,8 +3,6 @@ requests
 pandas
 numpy
 scikit-learn
-ta
 matplotlib
-mplfinance
+tzdata
 gunicorn==21.2.0
-google-generativeai
