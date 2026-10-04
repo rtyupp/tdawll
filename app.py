@@ -11,7 +11,7 @@ from ta.trend import MACD, EMAIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 import matplotlib
-matplotlib.use('Agg')  # مهم جداَ للسيرفرات بدون شاشة
+matplotlib.use('Agg')  # إلزامي للسيرفرات بدون شاشة رسومية
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 from datetime import datetime, timedelta
@@ -32,7 +32,7 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 print(f"✅ Config loaded: SYMBOL={SYMBOL}, RESOLUTION={RESOLUTION}")
 print(f"🔑 Keys present: Telegram={bool(TELEGRAM_TOKEN)}, Finnhub={bool(FINNHUB_KEY)}, Gemini={bool(GEMINI_API_KEY)}")
 
-# ===== ذاكرة المحادثة =====
+# ===== ذاكرة المحادثة (آخر 10 رسائل لكل شات لمنع النسيان) =====
 chat_memory = {}
 
 SYSTEM_PROMPT = """أنت خبير تداول مالي عالمي بمستوى مؤسساتي (Hedge Fund Level). 
@@ -46,9 +46,9 @@ SYSTEM_PROMPT = """أنت خبير تداول مالي عالمي بمستوى �
 def tg_send_text(text, chat_id=None):
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_TOKEN or not chat_id: return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
         return r.status_code == 200
     except Exception as e:
         print(f"Telegram send error: {e}")
@@ -58,11 +58,10 @@ def tg_send_text(text, chat_id=None):
 def tg_send_photo(photo_bytes, caption, chat_id=None):
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_TOKEN or not chat_id: return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     try:
         files = {"photo": ("chart.png", photo_bytes, "image/png")}
-        data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-        r = requests.post(url, files=files, data=data, timeout=30)
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                          files=files, data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}, timeout=30)
         return r.status_code == 200
     except Exception as e:
         print(f"Telegram photo error: {e}")
@@ -74,12 +73,9 @@ def fetch_bars_safe(symbol, resolution="15", count=200):
     try:
         to_ts = int(time.time())
         from_ts = to_ts - count * int(resolution) * 60
-        url = (f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}"
-               f"&resolution={resolution}&from={from_ts}&to={to_ts}&token={FINNHUB_KEY}")
-        r = requests.get(url, timeout=20)
-        j = r.json()
-        if j.get("s") != "ok" or not j.get("c"):
-            return None
+        url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution={resolution}&from={from_ts}&to={to_ts}&token={FINNHUB_KEY}"
+        j = requests.get(url, timeout=20).json()
+        if j.get("s") != "ok" or not j.get("c"): return None
         
         df = pd.DataFrame({
             "Open": j["o"], "High": j["h"], "Low": j["l"],
@@ -93,8 +89,7 @@ def fetch_bars_safe(symbol, resolution="15", count=200):
 
 # ===== حساب المؤشرات الفنية مع فحص مسبق =====
 def compute_indicators(df):
-    if df is None or len(df) < 20:
-        return None
+    if df is None or len(df) < 20: return None
     d = df.copy()
     d["RSI"] = RSIIndicator(d["Close"], 14).rsi()
     macd = MACD(d["Close"])
@@ -110,7 +105,7 @@ def compute_indicators(df):
     return d.dropna()
 
 
-# ===== التنبؤ بالذكاء الاصطناعي المحلي =====
+# ===== التنبؤ بالذكاء الاصطناعي المحلي (Random Forest) =====
 def predict(df):
     if df is None or len(df) < 30: return 0, {}, 0.0
     features = ["RSI", "MACD_Hist", "EMA_9", "EMA_21", "BB_Upper", "BB_Lower", "Stoch_K", "ATR"]
@@ -138,138 +133,95 @@ def predict(df):
 
 
 # ===== توليد نص التحليل الاحترافي =====
-def build_analysis_text(symbol, df, pred, probs, conf):
-    if df is None or len(df)==0: return "⚠️ لا توجد بيانات كافية للتحليل."
-    last = df.iloc[-1]
-    signal_map = {1: "🟢 شراء (Long)", -1: "🔴 بيع (Short)", 0: "⚪ انتظار (Neutral)"}
-    atr = last["ATR"]; price = last["Close"]
-    sl_buy = price - 1.5 * atr; tp_buy = price + 2.5 * atr
-    sl_sell = price + 1.5 * atr; tp_sell = price - 2.5 * atr
-    
-    trend = "صاعد 📈" if last["EMA_9"] > last["EMA_21"] else "هابط 📉"
-    rsi_zone = "تشبع شرائي ⚠️" if last["RSI"] > 70 else "تشبع بيعي 💡" if last["RSI"] < 30 else "محايد ➖"
-    
-    txt = f"""<b>🧠 تحليل {symbol} الاحترافي</b>
-
-<b>السعر:</b> ${price:.2f} | <b>الاتجاه:</b> {trend}
-<b>الإشارة:</b> {signal_map.get(pred, '⚪')} | <b>الثقة:</b> {conf:.1f}%
-
-<b>📊 المؤشرات الرئيسية:</b>
-• RSI(14): {last['RSI']:.1f} ({rsi_zone})
-• MACD Hist: {last['MACD_Hist']:.4f}
-• ATR: {atr:.2f}
-
-<b>🎯 خطة التداول المقترحة:</b>"""
-    if pred == 1:
-        txt += f"\n• Entry: ${price:.2f}\n• Stop Loss: ${sl_buy:.2f}\n• Take Profit: ${tp_buy:.2f}"
-    elif pred == -1:
-        txt += f"\n• Entry: ${price:.2f}\n• Stop Loss: ${sl_sell:.2f}\n• Take Profit: ${tp_sell:.2f}"
-    else:
-        txt += "\n• لا توجد إشارة واضحة. انتظر تأكيداَ فنياَ."
-        
-    txt += f"\n\n<b>الاحتمالات:</b>\n• شراء: {probs.get(1,0)}% | انتظار: {probs.get(0,0)}% | بيع: {probs.get(-1,0)}%"
-    txt += "\n\n<i>⚠️ تحليل تعليمي - ليس نصيحة مالية.</i>"
-    return txt
+def build_analysis_text(sym, df, pred, probs, conf):
+    if df is None or len(df)==0: return "⚠️ لا توجد بيانات كافية."
+    l = df.iloc[-1]; atr=l["ATR"]; pr=l["Close"]
+    smap={1:"🟢 شراء",-1:"🔴 بيع",0:"⚪ انتظار"}
+    trnd="صاعد 📈" if l["EMA_9"]>l["EMA_21"] else "هابط 📉"
+    rz="تشبع شرائي ⚠️" if l["RSI"]>70 else "تشبع بيعي 💡" if l["RSI"]<30 else "محايد ➖"
+    t=f"<b>🧠 تحليل {sym}</b>\n\n<b>السعر:</b> ${pr:.2f} | <b>الاتجاه:</b> {trnd}\n<b>الإشارة:</b> {smap.get(pred,'⚪')} | <b>الثقة:</b> {conf:.1f}%\n\n<b>📊 المؤشرات:</b>\n• RSI: {l['RSI']:.1f} ({rz})\n• MACD Hist: {l['MACD_Hist']:.4f}\n• ATR: {atr:.2f}\n\n<b>🎯 الخطة:</b>"
+    if pred==1: t+=f"\n• Entry: ${pr:.2f}\n• SL: ${pr-1.5*atr:.2f}\n• TP: ${pr+2.5*atr:.2f}"
+    elif pred==-1: t+=f"\n• Entry: ${pr:.2f}\n• SL: ${pr+1.5*atr:.2f}\n• TP: ${pr-2.5*atr:.2f}"
+    else: t+="\n• انتظر تأكيدا فنيا."
+    t+=f"\n\n<b>الاحتمالات:</b>\n• شراء:{probs.get(1,0)}% | انتظار:{probs.get(0,0)}% | بيع:{probs.get(-1,0)}%\n\n<i>⚠️ تحليل تعليمي - ليس نصيحة مالية.</i>"
+    return t
 
 
-# ===== رسم الشارت الاحترافي =====
-def generate_chart(symbol, df):
-    if df is None or len(df) < 20: return None
-    plot_df = df.tail(60).copy()
-    ap = [
-        mpf.make_addplot(plot_df["EMA_9"], color="#00ffff", width=1.2),
-        mpf.make_addplot(plot_df["EMA_21"], color="#ff8c00", width=1.2),
-        mpf.make_addplot(plot_df["BB_Upper"], color="#888888", width=0.6, linestyle="--"),
-        mpf.make_addplot(plot_df["BB_Lower"], color="#888888", width=0.6, linestyle="--"),
-    ]
-    style = mpf.make_mpf_style(base_mpf_style="charles", rc={"figure.facecolor": "#0a0a0a", "axes.facecolor": "#141414"})
-    buf = io.BytesIO()
-    fig, axes = mpf.plot(plot_df, type="candle", style=style, addplot=ap, volume=True,
-                         figsize=(12, 8), title=f"\n{symbol} - Real-Time Chart", returnfig=True)
-    
-    ax_rsi = fig.add_subplot(3, 1, 3)
-    ax_rsi.plot(plot_df.index, plot_df["RSI"], color="#00ff88", linewidth=1.5)
-    ax_rsi.axhline(70, color="#ff3366", linestyle="--", alpha=0.6)
-    ax_rsi.axhline(30, color="#00ff88", linestyle="--", alpha=0.6)
-    ax_rsi.set_ylabel("RSI", color="white"); ax_rsi.tick_params(colors="white"); ax_rsi.set_facecolor("#141414")
-    
-    plt.tight_layout()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor="#0a0a0a")
-    plt.close(fig); buf.seek(0)
-    return buf.read()
+# ===== رسم الشارت الاحترافي وإرساله كصورة =====
+def generate_chart(sym, df):
+    if df is None or len(df)<20: return None
+    p=df.tail(60).copy()
+    ap=[mpf.make_addplot(p["EMA_9"],color="#00ffff",width=1.2),
+        mpf.make_addplot(p["EMA_21"],color="#ff8c00",width=1.2),
+        mpf.make_addplot(p["BB_Upper"],color="#888",width=.6,linestyle="--"),
+        mpf.make_addplot(p["BB_Lower"],color="#888",width=.6,linestyle="--")]
+    st=mpf.make_mpf_style(base_mpf_style="charles",rc={"figure.facecolor":"#0a0a0a","axes.facecolor":"#141414"})
+    buf=io.BytesIO()
+    fig,_=mpf.plot(p,type="candle",style=st,addplot=ap,volume=True,figsize=(12,8),title=f"\n{sym}",returnfig=True)
+    ax=fig.add_subplot(3,1,3)
+    ax.plot(p.index,p["RSI"],color="#00ff88",lw=1.5)
+    ax.axhline(70,color="#ff3366",ls="--",alpha=.6);ax.axhline(30,color="#00ff88",ls="--",alpha=.6)
+    ax.set_ylabel("RSI",color="white");ax.tick_params(colors="white");ax.set_facecolor("#141414")
+    plt.tight_layout();fig.savefig(buf,format="png",dpi=120,bbox_inches="tight",facecolor="#0a0a0a")
+    plt.close(fig);buf.seek(0);return buf.read()
 
 
-# ===== رد الذكاء الاصطناعي العام عبر Google Gemini (النموذج الصحيح) =====
+# ===== الدالة الذكية التي تجرّب كل النماذج المتاحة تلقائياً =====
 def ai_general_reply(user_text, chat_id):
     if not GEMINI_API_KEY:
-        return "⚠️ محرك الذكاء الاصطناعي غير مهيأ. تأكد من وجود GEMINI_API_KEY في إعدادات Render."
+        return "⚠️ مفتاح Gemini غير مضبوط في Render Environment Variables."
     
     history = chat_memory.get(chat_id, [])
+    ctx = "\n".join([("User: "+m["content"]) if m["role"]=="user" else ("Model: "+m["content"]) for m in history[-6:]])
+    prompt = f"{SYSTEM_PROMPT}\n\nPrevious:\n{ctx}\n\nQuestion: {user_text}\nAnswer professionally in Arabic."
     
-    context_parts = []
-    for msg in history[-6:]:
-        role = "User" if msg["role"] == "user" else "Model"
-        context_parts.append(f"{role}: {msg['content']}")
+    # قائمة النماذج المرشحة بالترتيب (الأحدث والأقوى أولاً)
+    candidate_models = [
+        "gemini-2.5-flash",       # الأحدث والأفضل حالياً
+        "gemini-2.0-flash",       # مستقر وقوي
+        "gemini-2.0-flash-exp",   # نسخة تجريبية قد تكون متاحة
+        "gemini-1.5-flash",       # النسخة السابقة المستقرة
+        "gemini-1.5-pro",         # الأقوى لكن أبطأ وأغلى
+    ]
     
-    full_prompt = f"""{SYSTEM_PROMPT}
-
-Context from previous conversation:
-{'\n'.join(context_parts)}
-
-Current User Question: {user_text}
-
-Please provide a professional trading analysis response in Arabic."""
-
-    try:
-        # ✅ الإصلاح الجوهري: استخدام gemini-2.0-flash بدلاً من النسخ القديمة
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        
-        payload = {
-            "contents": [{
-                "parts": [{"text": full_prompt}]
-            }],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 800,
-                "topP": 0.95,
-                "topK": 40
-            }
-        }
-        
-        headers = {"Content-Type": "application/json"}
-        r = requests.post(url, json=payload, headers=headers, timeout=30)
-        
-        if r.status_code != 200:
-            error_detail = r.json().get("error", {}).get("message", str(r.text))[:100]
-            return f"❌ خطأ من Gemini: {error_detail}"
+    last_error = ""
+    for model_name in candidate_models:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+            payload = {"contents":[{"parts":[{"text":prompt}]}],
+                       "generationConfig":{"temperature":0.7,"maxOutputTokens":800}}
+            r = requests.post(url, json=payload, headers={"Content-Type":"application/json"}, timeout=30)
             
-        data = r.json()
-        
-        candidates = data.get("candidates", [])
-        if not candidates or not candidates[0].get("content"):
-            return "⚠️ لم يرجع Gemini رداً واضحاً. حاول مرة أخرى."
+            if r.status_code == 200:
+                data = r.json()
+                cand = data.get("candidates",[])
+                if cand and cand[0].get("content"):
+                    parts = cand[0]["content"].get("parts",[])
+                    reply = "".join([p.get("text","") for p in parts]).strip()
+                    if reply:
+                        # حفظ الذاكرة فقط عند النجاح
+                        history.append({"role":"user","content":user_text})
+                        history.append({"role":"assistant","content":reply})
+                        chat_memory[chat_id] = history[-20:]
+                        print(f"✅ Used model: {model_name}")
+                        return reply
             
-        parts = candidates[0]["content"].get("parts", [])
-        reply = "".join([p.get("text", "") for p in parts]).strip()
-        
-        if not reply:
-             return "⚠️ رد فارغ من الذكاء الاصطناعي."
-
-        history.append({"role": "user", "content": user_text})
-        history.append({"role": "assistant", "content": reply})
-        chat_memory[chat_id] = history[-20:]
-        
-        return reply
-        
-    except Exception as e:
-        return f"❌ فشل الاتصال بـ Gemini: {str(e)[:80]}"
+            err_body = r.text[:150]
+            last_error = f"{model_name}: HTTP {r.status_code} - {err_body}"
+            print(f"❌ Tried {model_name} -> {last_error}")
+            
+        except Exception as e:
+            last_error = f"{model_name}: {str(e)[:80]}"
+            continue
+    
+    return f"❌ لم ينجح أي نموذج Gemini.\nآخر خطأ: {last_error[:200]}\n\n💡 تحقق من الرابط التالي لمعرفة النماذج المتاحة لديك:\nhttps://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY"
 
 
 # ===== معالجة الأوامر الذكية =====
 def handle_command(text, chat_id):
-    t = text.lower().strip()
+    t=text.lower().strip()
     
-    if t.startswith("/start") or t == "/help":
+    if t.startswith("/start") or t=="/help":
         return ("<b>👋 أهلاَ بك! أنا بوت التداول الخبير.</b>\n\n"
                 "<b>الأوامر المتاحة:</b>\n"
                 "• /analyze → تحليل فوري كامل مع خطة دخول ووقف\n"
@@ -365,7 +317,7 @@ def webhook():
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "expert-trading-v6-final",
+        "bot": "smart-model-v8-final",
         "symbol": SYMBOL,
         "ai_ready": bool(GEMINI_API_KEY),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -376,7 +328,7 @@ def health():
 def monitor_loop():
     last_alert = 0
     time.sleep(8)
-    tg_send_text(f"✅ <b>Expert Bot Online (v6 Final)</b>\n📡 يراقب {SYMBOL} كل {CHECK_INTERVAL//60} دقيقة\nاكتب /help للأوامر")
+    tg_send_text(f"✅ <b>Expert Bot Online (Smart Model v8)</b>\n📡 يراقب {SYMBOL} كل {CHECK_INTERVAL//60} دقيقة\nاكتب /help للأوامر")
     while True:
         try:
             raw_df = fetch_bars_safe(SYMBOL, RESOLUTION, 200)
