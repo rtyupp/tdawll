@@ -169,53 +169,54 @@ def generate_chart(sym, df):
 # ===== الدالة الذكية التي تجرّب كل النماذج المتاحة تلقائياً =====
 def ai_general_reply(user_text, chat_id):
     if not GEMINI_API_KEY:
-        return "⚠️ مفتاح Gemini غير مضبوط في Render Environment Variables."
+        return "⚠️ مفتاح Gemini غير مضبوط."
     
     history = chat_memory.get(chat_id, [])
     ctx = "\n".join([("User: "+m["content"]) if m["role"]=="user" else ("Model: "+m["content"]) for m in history[-6:]])
-    prompt = f"{SYSTEM_PROMPT}\n\nPrevious:\n{ctx}\n\nQuestion: {user_text}\nAnswer professionally in Arabic."
+    prompt = f"{SYSTEM_PROMPT}\n\nPrevious Context:\n{ctx}\n\nCurrent Question: {user_text}\nAnswer professionally in Arabic."
     
-    # قائمة النماذج المرشحة بالترتيب (الأحدث والأقوى أولاً)
-    candidate_models = [
-        "gemini-2.5-flash",       # الأحدث والأفضل حالياً
-        "gemini-2.0-flash",       # مستقر وقوي
-        "gemini-2.0-flash-exp",   # نسخة تجريبية قد تكون متاحة
-        "gemini-1.5-flash",       # النسخة السابقة المستقرة
-        "gemini-1.5-pro",         # الأقوى لكن أبطأ وأغلى
-    ]
-    
-    last_error = ""
-    for model_name in candidate_models:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-            payload = {"contents":[{"parts":[{"text":prompt}]}],
-                       "generationConfig":{"temperature":0.7,"maxOutputTokens":800}}
-            r = requests.post(url, json=payload, headers={"Content-Type":"application/json"}, timeout=30)
+    try:
+        # ✅ الاسم الصحيح المستخرج من قائمتك الرسمية
+        model_name = "gemini-2.5-flash" 
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 800,
+                "topP": 0.95,
+                "topK": 64
+            }
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        
+        if r.status_code == 200:
+            data = r.json()
+            cand = data.get("candidates", [])
+            if cand and cand[0].get("content"):
+                parts = cand[0]["content"].get("parts", [])
+                reply = "".join([p.get("text","") for p in parts]).strip()
+                if reply:
+                    # حفظ الذاكرة
+                    history.append({"role":"user","content":user_text})
+                    history.append({"role":"assistant","content":reply})
+                    chat_memory[chat_id] = history[-20:]
+                    print(f"✅ SUCCESS using model: {model_name}")
+                    return reply
             
-            if r.status_code == 200:
-                data = r.json()
-                cand = data.get("candidates",[])
-                if cand and cand[0].get("content"):
-                    parts = cand[0]["content"].get("parts",[])
-                    reply = "".join([p.get("text","") for p in parts]).strip()
-                    if reply:
-                        # حفظ الذاكرة فقط عند النجاح
-                        history.append({"role":"user","content":user_text})
-                        history.append({"role":"assistant","content":reply})
-                        chat_memory[chat_id] = history[-20:]
-                        print(f"✅ Used model: {model_name}")
-                        return reply
+            return "⚠️ رد فارغ من النموذج."
             
-            err_body = r.text[:150]
-            last_error = f"{model_name}: HTTP {r.status_code} - {err_body}"
-            print(f"❌ Tried {model_name} -> {last_error}")
-            
-        except Exception as e:
-            last_error = f"{model_name}: {str(e)[:80]}"
-            continue
-    
-    return f"❌ لم ينجح أي نموذج Gemini.\nآخر خطأ: {last_error[:200]}\n\n💡 تحقق من الرابط التالي لمعرفة النماذج المتاحة لديك:\nhttps://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY"
-
+        error_detail = r.text[:200]
+        print(f"❌ ERROR ({r.status_code}): {error_detail}")
+        return f"❌ خطأ من Gemini: {error_detail}"
+        
+    except Exception as e:
+        err_msg = str(e)[:100]
+        print(f"❌ EXCEPTION: {err_msg}")
+        return f"❌ فشل الاتصال: {err_msg}"
 
 # ===== معالجة الأوامر الذكية =====
 def handle_command(text, chat_id):
