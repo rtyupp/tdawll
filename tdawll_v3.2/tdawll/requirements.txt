@@ -1,0 +1,8 @@
+flask
+requests
+pandas
+numpy
+scikit-learn
+matplotlib
+tzdata
+gunicorn==21.2.0
