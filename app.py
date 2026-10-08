@@ -814,8 +814,8 @@ def card_text(S, with_news=True, ext=False):
 
 # ============================== العقل (Gemini) ==============================
 def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
-    if not llm.GEMINI_API_KEY:
-        return "⚠️ مفتاح Gemini غير مضبوط."
+    if not llm.GROQ_API_KEY:
+        return "⚠️ مفتاح Groq غير مضبوط."
     hist = chat_memory.get(chat_id, []) if chat_id else []
     contents = [{"role": "user" if m["r"] == "u" else "model", "parts": [{"text": m["c"]}]} for m in hist[-6:]]
     body = (f"[البطاقة الفنية الحية — المصدر الوحيد للأرقام]\n{card}\n\n" if card else
@@ -2212,7 +2212,7 @@ def health():
         live = dict(_live_ws)
     live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
                                    if live.get("last_trade") else None)
-    return jsonify({"status": "ok", "bot": "tdawll-v3.5-groq-monitor", "version": "groq-only", "focus": state["focus"], "timeframe": "5m",
+    return jsonify({"status": "ok", "bot": "tdawll-v3.5-groq-monitor", "version": "groq-only-testfix", "focus": state["focus"], "timeframe": "5m",
                     "monitor": {"heartbeat": _monitor_heartbeat,
                                 "age_sec": round(time.time() - _monitor_heartbeat, 1) if _monitor_heartbeat else None},
                     "data_primary": "alpaca_rest_snapshot" if not ALPACA_WS_ENABLED else "alpaca_iex_websocket",
