@@ -433,10 +433,11 @@ def candles(symbol, interval="5m", rng="60d"):
     def go():
         days = 12 if interval == "5m" else 365
         df = alpaca_candles(symbol, days=days, interval=interval)
-        if df is not None:
-            _data_meta.update(source="alpaca_iex", last_ok=time.time(), last_error="", bars=len(df))
-        else:
-            _data_meta.update(source="alpaca_unavailable", last_error=f"لا بيانات Alpaca لـ {symbol} {interval}", bars=0)
+        if symbol == PRIMARY_LIVE_SYMBOL:
+            if df is not None:
+                _data_meta.update(source="alpaca_iex", last_ok=time.time(), last_error="", bars=len(df))
+            else:
+                _data_meta.update(source="alpaca_unavailable", last_error=f"لا بيانات Alpaca لـ {symbol} {interval}", bars=0)
         return df
     return cached(f"c:{symbol}:{interval}:{rng}", 20 if interval != "1d" else 600, go)
 
@@ -532,7 +533,9 @@ def daily_context(sym):
 
 def macro_context():
     out = {}
-    for key, sym in (("vix", "^VIX"), ("tnx", "^TNX")):
+    # Alpaca IEX يدعم الأسهم/الصناديق فقط، وليس رموز المؤشرات ^VIX و^TNX.
+    # لا نستخدم بدائل تقريبية حتى لا نعرضها كأنها VIX أو عائد الخزانة الحقيقي.
+    for key, sym in ():
         d = candles(sym, "1d", "1mo")
         if d is not None and len(d) >= 2:
             v, p = float(d["Close"].iloc[-1]), float(d["Close"].iloc[-2])
@@ -2208,7 +2211,7 @@ def health():
         live = dict(_live_ws)
     live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
                                    if live.get("last_trade") else None)
-    return jsonify({"status": "ok", "bot": "tdawll-v3.5-groq-monitor", "version": "b1fa9c1", "focus": state["focus"], "timeframe": "5m",
+    return jsonify({"status": "ok", "bot": "tdawll-v3.5-groq-monitor", "version": "0d70d3f", "focus": state["focus"], "timeframe": "5m",
                     "monitor": {"heartbeat": _monitor_heartbeat,
                                 "age_sec": round(time.time() - _monitor_heartbeat, 1) if _monitor_heartbeat else None},
                     "data_primary": "alpaca_rest_snapshot" if not ALPACA_WS_ENABLED else "alpaca_iex_websocket",
