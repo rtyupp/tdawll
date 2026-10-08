@@ -36,6 +36,7 @@ FINNHUB_KEY = os.environ.get("FINNHUB_KEY")  # الأخبار القديمة ف�
 ALPACA_KEY = os.environ.get("ALPACA_KEY") or os.environ.get("APCA_API_KEY_ID")
 ALPACA_SECRET = os.environ.get("ALPACA_SECRET") or os.environ.get("APCA_API_SECRET_KEY")
 ALPACA_DATA_URL = "https://data.alpaca.markets"
+ALPACA_WS_ENABLED = os.environ.get("ALPACA_WS_ENABLED", "0") == "1"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 ALLOWED_CHATS = {x.strip() for x in os.environ.get("ALLOWED_CHAT_IDS", TELEGRAM_CHAT_ID).split(",") if x.strip()}
@@ -386,6 +387,10 @@ def _alpaca_message(_, message):
 
 
 def _alpaca_ws_loop():
+    if not ALPACA_WS_ENABLED:
+        with _live_lock: _live_ws["state"] = "rest_primary_ws_disabled"
+        log.info("Alpaca WebSocket disabled; REST Snapshot is primary")
+        return
     if not ALPACA_KEY or not ALPACA_SECRET or websocket is None:
         with _live_lock: _live_ws["state"] = "unavailable"
         log.warning("live source unavailable: ALPACA_KEY/ALPACA_SECRET or websocket-client missing")
@@ -413,8 +418,11 @@ def _alpaca_ws_loop():
 
 
 def _alpaca_quote_loop():
-    """نبض REST مجاني احتياطي من آخر صفقة IEX كل 15 ثانية."""
-    if not ALPACA_KEY or not ALPACA_SECRET: return
+    """مصدر اللحظة الأساسي المجاني: Alpaca Snapshot عبر IEX كل 5 ثوانٍ."""
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        log.warning("Alpaca REST disabled: missing credentials")
+        return
+    log.info("Alpaca REST Snapshot polling started: %s", PRIMARY_LIVE_SYMBOL)
     while True:
         try:
             params = {"feed": "iex"}
@@ -428,13 +436,17 @@ def _alpaca_quote_loop():
                 sj = sr.json() if sr.ok else {}
                 tr = sj.get("latestTrade") or {}
             if tr.get("p") and tr.get("t"):
-                _record_live_tick(float(tr["p"]), float(tr.get("s", 0) or 0), pd.Timestamp(tr["t"]).timestamp(), "alpaca_rest")
+                stamp = pd.Timestamp(tr["t"]).timestamp()
+                if time.time() - stamp <= 180:
+                    _record_live_tick(float(tr["p"]), float(tr.get("s", 0) or 0), stamp, "alpaca_rest")
+                else:
+                    with _live_lock: _live_ws.update(state="rest_stale", error="Alpaca latestTrade أقدم من 180 ثانية")
             else:
                 detail = r.text[:120] if not r.ok else "no latestTrade in trade/snapshot response"
                 with _live_lock: _live_ws.update(state="rest_waiting", error=f"Alpaca REST: {detail}")
         except Exception as e:
-            with _live_lock: _live_ws["error"] = str(e)[:180]
-        time.sleep(15)
+            with _live_lock: _live_ws.update(state="rest_error", error=str(e)[:180])
+        time.sleep(5)
 
 
 def _live_ws_error(_, error):
@@ -2190,7 +2202,8 @@ def health():
     live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
                                    if live.get("last_trade") else None)
     return jsonify({"status": "ok", "bot": "tdawll-v3.4", "focus": state["focus"], "timeframe": "5m",
-                    "data_primary": "alpaca_iex_ws_or_rest", "data_fallback": "yahoo_chart",
+                    "data_primary": "alpaca_rest_snapshot" if not ALPACA_WS_ENABLED else "alpaca_iex_websocket",
+                    "data_fallback": "yahoo_chart", "alpaca_ws_enabled": ALPACA_WS_ENABLED,
                     "alpaca_configured": bool(ALPACA_KEY and ALPACA_SECRET),
                     "live": live, "data": dict(_data_meta), "last_scan": dict(_scan_status), "session": s,
                     "uptime_min": int((time.time() - _started) / 60), "time_et": now_et().strftime("%H:%M:%S")})
