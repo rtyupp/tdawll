@@ -14,7 +14,7 @@ log = logging.getLogger("tdawll.xmarket")
 EQUITY = ("QQQ", "IWM", "XLK", "SMH")
 CREDIT = "HYG"
 VIX_SYMS = {"vix9d": "^VIX9D", "vix": "^VIX", "vix3m": "^VIX3M", "vvix": "^VVIX"}
-BARS = 8
+BARS = 24
 _pool = ThreadPoolExecutor(max_workers=6)
 
 

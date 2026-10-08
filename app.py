@@ -55,6 +55,8 @@ _started = time.time()
 _live_lock = threading.Lock()
 _live_bars = {}
 _live_ws = {"state": "disabled", "last_trade": None, "error": ""}
+_data_meta = {"source": "unknown", "last_ok": None, "last_error": "", "bars": 0}
+_scan_status = {"at": None, "result": "never", "reason": "لم تبدأ دورة الفحص بعد", "symbol": "SPY"}
 BAR_MINUTES = 5
 PRIMARY_LIVE_SYMBOL = "SPY"
 
@@ -379,8 +381,14 @@ def candles(symbol, interval="5m", rng="60d"):
         # Finnhub + WebSocket هو الأساسي لفريم 5 دقائق؛ Yahoo آخر احتياط.
         if symbol == PRIMARY_LIVE_SYMBOL and interval == "5m":
             df = finnhub_candles(symbol, res="5", days=12)
-            if df is not None: return df
+            if df is not None:
+                _data_meta.update(source="finnhub", last_ok=time.time(), last_error="", bars=len(df))
+                return df
         df = yahoo_candles(symbol, interval, rng)
+        if df is not None:
+            _data_meta.update(source="yahoo_fallback", last_ok=time.time(), last_error="", bars=len(df))
+        else:
+            _data_meta.update(last_error=f"لا بيانات لـ {symbol} {interval}")
         return df
     return cached(f"c:{symbol}:{interval}:{rng}", 20 if interval != "1d" else 600, go)
 
@@ -733,7 +741,7 @@ def card_text(S, with_news=True, ext=False):
         f"NOW_ET={n:%Y-%m-%d %H:%M} ({n:%A}) | SESSION={S['sess_txt']} | LAST_BAR_ET={S['last_bar']:%Y-%m-%d %H:%M}"
         + (" | تحذير: البيانات متأخرة" if S["stale"] else ""),
         f"SYMBOL={S['label']} | PRICE={S['price']:.2f} | CHG_VS_PREV_CLOSE={S['chg']:+.2f}%",
-        f"15M: TREND={trend} EMA9={l['EMA9']:.2f} EMA21={l['EMA21']:.2f} EMA50={l['EMA50']:.2f} | RSI={l['RSI']:.1f} "
+        f"5M: TREND={trend} EMA9={l['EMA9']:.2f} EMA21={l['EMA21']:.2f} EMA50={l['EMA50']:.2f} | RSI={l['RSI']:.1f} "
         f"MACD_H={l['MACD_H']:.3f} STOCH={l['STOCH']:.0f} ATR={S['atr']:.2f} %B={l['PCTB']:.2f} VOLx={l['VOLR']:.1f} "
         f"VWAP={l['VWAP']:.2f} ({'السعر فوقه' if l['Close'] > l['VWAP'] else 'السعر تحته'})",
     ]
@@ -1186,10 +1194,28 @@ def active_signals(S, lookback=3):
     return out, P
 
 
+def _scan_set(result, reason, symbol=None):
+    _scan_status.update(at=time.time(), result=result, reason=reason, symbol=symbol or state["focus"])
+
+
 def live_scan(force_chat=None):
     S = snapshot(closed_only=True)
-    if not S or S["stale"]: return 0
+    if not S:
+        _scan_set("blocked", "لا توجد بطاقة بيانات كافية")
+        return 0
+    if S["stale"]:
+        _scan_set("blocked", "الشمعة الأخيرة قديمة؛ تم منع التوصية")
+        return 0
     d = S["d"]; P = prep(d); i = len(d) - 1
+    if len(d) < 120:
+        _scan_set("blocked", f"بيانات غير كافية: {len(d)} شمعة فقط")
+        return 0
+    # سقف مجاني ومحافظ: لا نسمح بأكثر من ثلاث إشارات جديدة في جلسة واحدة.
+    today = now_et().date()
+    today_count = sum(1 for x in live_sigs if pd.Timestamp(x.get("ts", 0)).date() == today and x.get("ann"))
+    if today_count >= int(os.environ.get("MAX_DAILY_SIGNALS", "3")):
+        _scan_set("blocked", f"تم بلوغ سقف إشارات الجلسة ({today_count})")
+        return 0
     minr = GRADE_RANK.get(settings["min_grade"], 2)
     OF, XM = get_of(S), get_xm(S)
     sigs = [s for s in enrich(signals_at(P, i, make_ctx(S)), OF, XM) if GRADE_RANK[s["grade"]] >= minr]
@@ -1198,7 +1224,9 @@ def live_scan(force_chat=None):
         dup = any(x["name"] == s["name"] and x["dir"] == s["dir"] and
                   abs((pd.Timestamp(s["ts"]) - pd.Timestamp(x["ts"])).total_seconds()) < 7200 for x in live_sigs[-60:])
         if not dup: fresh.append(s)
-    if not fresh: return 0
+    if not fresh:
+        _scan_set("empty", "لا توجد إشارة جديدة اجتازت حد الجودة والتكرار")
+        return 0
     best, others = fresh[0], fresh[1:]
 
     # لجنة التداول: ثور/دب/حكم في طلب Gemini واحد، مع دروس سابقة وموقفك الحالي
@@ -1210,13 +1238,20 @@ def live_scan(force_chat=None):
                                    agents.position_context(pos_state["v"], S["price"], S["atr"]))
     if cm:
         best["ai_rating"], best["ai_agree"], best["ai_conf"] = cm["rating"], cm["agree"], cm["confidence"]
+        best["ai_decision"], best["ai_regime"] = cm.get("decision", "wait"), cm.get("regime", "unclear")
+        best["ai_data_quality"] = cm.get("data_quality", "degraded")
     veto = bool(cm and cm["agree"] == -1)
+    if cm and cm.get("data_quality") == "stale":
+        veto = True
+    if cm and cm.get("decision") in {"reject", "wait"} and cm.get("confidence") == "high":
+        veto = True
     if veto and gate == "hard":                            # نسجّلها لنقيس: هل كان الفيتو في محله؟
         for x in fresh: x["sent"] = False; x["ann"] = False; x["done"] = False; x["label"] = S["label"]; x["ev"] = []
         best["vetoed"] = True
         with _lock: live_sigs.extend(fresh)
         save_state()
         log.info("alert vetoed by committee: %s %s", best["name"], best["dir"])
+        _scan_set("vetoed", f"اللجنة حجبت الإشارة: {cm.get('decision', 'conflict') if cm else 'conflict'}")
         return 0
     txt = signal_text(best, S, None, others)
     if cm:
@@ -1244,6 +1279,7 @@ def live_scan(force_chat=None):
                        f"هدف1 {best['t1']:.2f} · هدف2 {best['t2']:.2f}\nتأكد أن البوت <b>مشرف</b> في القناة ولديه صلاحية نشر الرسائل (/channel test).")
     with _lock: live_sigs.extend(fresh)
     save_state()
+    _scan_set("posted" if posted else "send_failed", "تم نشر الإشارة" if posted else f"فشل الإرسال: {_last_tg_err['v']}")
     return len(fresh)
 
 
@@ -1468,7 +1504,7 @@ def commands_text(owner=True):
                 "<i>التوصيات تصل في القناة. هذا تحليل فني آلي وليس توصية استثمارية.</i>")
     return ("📋 <b>جميع الأوامر</b>\n\n"
             "<b>🎯 الفرص والتحليل</b>\n/scan — الفرص النشطة الآن + ما يتشكل\n/analyze — تحليل ذكي شامل\n/debate — لجنة كاملة + تقرير HTML\n"
-            "/chart — الشارت · /levels — المستويات\n/price — السعر · /news — الأخبار\n\n"
+            "/chart — الشارت · /levels — المستويات\n/price — السعر · /news — الأخبار\n/data_status — حالة المصدر اللحظي\n/why_no_signal — لماذا لم تصدر توصية؟\n\n"
             "<b>🌐 السياق</b>\n/sentiment — مزاج StockTwits/Reddit/Polymarket\n/macro — FRED والأسواق التنبؤية\n"
             "/flow — حالة الأوبشن (جدران الغاما والانقلاب)\n/options — هياكل أوبشن للفرصة\n\n"
             "<b>📊 القياس</b>\n/stats — الأداء الحي والباكتست\n/edge — هل لدينا أفضلية؟\n/backtest — إعادة القياس\n/memory — دروس اللجنة\n\n"
@@ -1481,6 +1517,23 @@ def commands_text(owner=True):
 
 def h_commands(chat, arg=""):
     tg_text(commands_text(is_owner()), chat, keyboard())
+
+
+def h_data_status(chat, arg=""):
+    with _live_lock: live = dict(_live_ws)
+    age = (time.time() - live["last_trade"] if live.get("last_trade") else None)
+    msg = (f"📡 <b>حالة البيانات</b>\nالمصدر الأساسي: Finnhub WebSocket\n"
+           f"الحالة: <b>{live.get('state')}</b>\n"
+           f"آخر Tick: {f'قبل {age:.1f} ثانية' if age is not None else 'لا يوجد بعد'}\n"
+           f"مصدر الشموع: <b>{_data_meta.get('source')}</b> · عددها {_data_meta.get('bars', 0)}\n"
+           f"الاحتياطي: Yahoo Chart\nالفريم: <b>5 دقائق</b>")
+    tg_text(msg, chat, keyboard())
+
+
+def h_why_no_signal(chat, arg=""):
+    st = _scan_status
+    when = datetime.fromtimestamp(st["at"], NY).strftime("%H:%M:%S") if st.get("at") else "—"
+    tg_text(f"🔎 <b>سبب آخر فحص</b> · {when}\nالحالة: <b>{st.get('result')}</b>\n{html.escape(st.get('reason', '—'))}", chat, keyboard())
 
 
 def h_panel(chat, arg=""):
@@ -1914,7 +1967,7 @@ def h_risk(chat, arg=""):
     tg_text("\n".join(L), chat, keyboard())
 
 
-ROUTES = {"commands": h_commands, "flow": h_flow, "options": h_options, "edge": h_edge, "scan": h_scan, "sentiment": h_sentiment, "macro": h_macro, "memory": h_memory, "stats": h_stats, "backtest": h_backtest, "alerts": h_alerts, "clear": h_clear, "start": h_start, "help": h_start, "switch": h_switch, "price": h_price, "levels": h_levels,
+ROUTES = {"commands": h_commands, "data_status": h_data_status, "why_no_signal": h_why_no_signal, "flow": h_flow, "options": h_options, "edge": h_edge, "scan": h_scan, "sentiment": h_sentiment, "macro": h_macro, "memory": h_memory, "stats": h_stats, "backtest": h_backtest, "alerts": h_alerts, "clear": h_clear, "start": h_start, "help": h_start, "switch": h_switch, "price": h_price, "levels": h_levels,
           "analyze": h_analyze, "chart": h_chart, "news": h_news}
 
 
@@ -2040,6 +2093,7 @@ def webhook():
 
 @app.route("/")
 @app.route("/health")
+@app.route("/data_status")
 def health():
     s, t = session_info()
     with _live_lock:
@@ -2048,8 +2102,13 @@ def health():
                                    if live.get("last_trade") else None)
     return jsonify({"status": "ok", "bot": "tdawll-v3.4", "focus": state["focus"], "timeframe": "5m",
                     "data_primary": "finnhub_websocket", "data_fallback": "yahoo_chart",
-                    "live": live, "session": s,
+                    "live": live, "data": dict(_data_meta), "last_scan": dict(_scan_status), "session": s,
                     "uptime_min": int((time.time() - _started) / 60), "time_et": now_et().strftime("%H:%M:%S")})
+
+
+@app.route("/why_no_signal")
+def why_no_signal():
+    return jsonify(dict(_scan_status))
 
 
 def setup_webhook():

@@ -67,7 +67,11 @@ STR = {"type": "STRING"}
 CONF = _enum(["low", "medium", "high"])
 NUM = {"type": "NUMBER", "nullable": True}
 SCHEMA_LITE = {"type": "OBJECT", "properties": {"bull": STR, "bear": STR, "rating": _enum(RATINGS), "confidence": CONF,
-                                                 "verdict": STR, "invalidation": STR},
+                                                 "verdict": STR, "invalidation": STR,
+                                                 "decision": _enum(["approve", "reduce", "reject", "wait"]),
+                                                 "regime": _enum(["trend", "range", "high_volatility", "unclear"]),
+                                                 "timeframe_alignment": _enum(["aligned", "mixed", "conflicting"]),
+                                                 "data_quality": _enum(["good", "degraded", "stale"])},
                "required": ["bull", "bear", "rating", "confidence", "verdict", "invalidation"]}
 SCHEMA_PLAN = {"type": "OBJECT", "properties": {"recommendation": _enum(RATINGS), "rationale": STR, "strategic_actions": STR},
                "required": ["recommendation", "rationale", "strategic_actions"]}
@@ -107,6 +111,10 @@ def committee_lite(card, label, sig, lessons="", position=""):
               "VIX, news, nearby levels, thin or negative backtest, social extremes (Arabic, max 30 words).\n"
               "- rating: your verdict on the market direction (Buy/Overweight/Hold/Underweight/Sell) after weighing both.\n"
               "- confidence: low/medium/high based on how decisively one side wins and on data quality.\n"
+              "- decision: exactly approve/reduce/reject/wait; reject or wait if data is stale or the setup is not actionable.\n"
+              "- regime: exactly trend/range/high_volatility/unclear.\n"
+              "- timeframe_alignment: exactly aligned/mixed/conflicting using daily versus 5-minute evidence.\n"
+              "- data_quality: exactly good/degraded/stale; never call delayed or missing data good.\n"
               "- verdict: one actionable Arabic sentence (max 22 words).\n"
               "- invalidation: where the idea is wrong, using a price from the card (Arabic, max 14 words).")
     o = llm.generate_json(_sys(label), prompt, SCHEMA_LITE, deep=False, tokens=420,
@@ -118,14 +126,19 @@ def committee_lite(card, label, sig, lessons="", position=""):
     agree = None if (d is None or not sig) else (1 if d == sig["dir"] else 0 if d == 0 else -1)
     return {"bull": str(o.get("bull", "")), "bear": str(o.get("bear", "")), "rating": r, "dir": d,
             "confidence": o.get("confidence") if o.get("confidence") in CONF_AR else "low",
-            "verdict": str(o.get("verdict", "")), "invalidation": str(o.get("invalidation", "")), "agree": agree}
+            "verdict": str(o.get("verdict", "")), "invalidation": str(o.get("invalidation", "")), "agree": agree,
+            "decision": o.get("decision") if o.get("decision") in {"approve", "reduce", "reject", "wait"} else "wait",
+            "regime": o.get("regime") if o.get("regime") in {"trend", "range", "high_volatility", "unclear"} else "unclear",
+            "timeframe_alignment": o.get("timeframe_alignment") if o.get("timeframe_alignment") in {"aligned", "mixed", "conflicting"} else "mixed",
+            "data_quality": o.get("data_quality") if o.get("data_quality") in {"good", "degraded", "stale"} else "degraded"}
 
 
 def lite_block(cm):
     """نص تيليجرام (HTML آمن) لنتيجة اللجنة السريعة."""
     e = html.escape
     tag = {1: "✅ توافق مع الإشارة", 0: "⚪ محايد", -1: "⛔ تعارض مع الإشارة", None: ""}[cm["agree"]]
-    return (f"⚖️ <b>اللجنة</b>: {RATING_AR.get(cm['rating'], cm['rating'])} · {CONF_AR.get(cm['confidence'], '')} {tag}\n"
+    return (f"⚖️ <b>اللجنة</b>: {RATING_AR.get(cm['rating'], cm['rating'])} · {CONF_AR.get(cm['confidence'], '')} · {cm.get('decision', 'wait')} {tag}\n"
+            f"🧭 النظام: {cm.get('regime', 'unclear')} · توافق الفريمات: {cm.get('timeframe_alignment', 'mixed')} · جودة البيانات: {cm.get('data_quality', 'degraded')}\n"
             f"🐂 {e(cm['bull'])}\n🐻 {e(cm['bear'])}\n💬 {e(cm['verdict'])}\n🚫 الإبطال: {e(cm['invalidation'])}")
 
 
