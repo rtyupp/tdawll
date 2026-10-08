@@ -405,7 +405,11 @@ def _alpaca_ws_loop():
             ws.run_forever(ping_interval=15, ping_timeout=8, dispatcher=None)
         except Exception as e:
             _live_ws_error(None, e)
-        time.sleep(5)
+        with _live_lock:
+            err = str(_live_ws.get("error", ""))
+        # Alpaca يسمح باتصال واحد عادةً؛ لا نعيد المحاولة بسرعة أثناء نشر Render.
+        delay = 65 if "connection limit" in err.lower() else 8
+        time.sleep(delay)
 
 
 def _alpaca_quote_loop():
