@@ -873,7 +873,10 @@ SETUP_AR = {"ORB": "اختراق نطاق الافتتاح", "VWAP": "استعا
             "RETEST": "إعادة اختبار أعلى/أدنى أمس بعد الاختراق", "DIVERGENCE": "دايفرجنس RSI", "EXHAUST": "ارتداد من تطرف (بولنجر+RSI)"}
 BASE_SCORE = {"ORB": 52, "VWAP": 48, "PULLBACK": 52, "SQUEEZE": 50, "SWEEP": 55, "RETEST": 52, "DIVERGENCE": 50, "EXHAUST": 45}
 REVERSAL = {"SWEEP", "DIVERGENCE", "EXHAUST", "VWAP"}
-DISABLED = {x.strip().upper() for x in os.environ.get("DISABLED_SETUPS", "").split(",") if x.strip()}
+# فلتر محافظ مبني على اختبار 60 يومًا لـ SPY/5m (2026-07-16 إلى 2026-10-08).
+# يمكن إعادة أي إعداد للاختبار عبر DISABLED_SETUPS= أو قائمة مخصصة في Render.
+DEFAULT_DISABLED_SETUPS = "SWEEP,SQUEEZE,DIVERGENCE,RETEST"
+DISABLED = {x.strip().upper() for x in os.environ.get("DISABLED_SETUPS", DEFAULT_DISABLED_SETUPS).split(",") if x.strip()}
 COST_R = 0.05                                            # تكلفة افتراضية (انزلاق/عمولة) بوحدة R
 STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "/tmp"), "tdawll_state.json")
 settings = {"min_grade": os.environ.get("MIN_GRADE", "B").upper(), "gate": os.environ.get("AI_GATE", "soft").lower(), "account": None,
@@ -1299,6 +1302,14 @@ def live_scan(force_chat=None):
     minr = GRADE_RANK.get(settings["min_grade"], 2)
     OF, XM = get_of(S), get_xm(S)
     sigs = [s for s in enrich(signals_at(P, i, make_ctx(S)), OF, XM) if GRADE_RANK[s["grade"]] >= minr]
+    # لا نسمح بإعداد سلبي تاريخياً بعد توفر عينة كافية، حتى لا تعود إشاراته
+    # بسبب تغيير حد الجودة فقط. هذا فلتر بحثي محافظ وليس ضمان ربح.
+    bt_min_n = int(os.environ.get("BACKTEST_GATE_MIN_TRADES", "15"))
+    bt_min_avg = float(os.environ.get("BACKTEST_GATE_MIN_AVGR", "0.0"))
+    if BT.get("stats"):
+        sigs = [s for s in sigs if not (
+            (st := BT["stats"].get(s["name"])) and st.get("n", 0) >= bt_min_n and st.get("avgR", 0.0) < bt_min_avg
+        )]
     fresh = []
     for s in sigs:
         dup = any(x["name"] == s["name"] and x["dir"] == s["dir"] and
