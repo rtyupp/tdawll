@@ -37,7 +37,6 @@ ALPACA_KEY = os.environ.get("ALPACA_KEY") or os.environ.get("APCA_API_KEY_ID")
 ALPACA_SECRET = os.environ.get("ALPACA_SECRET") or os.environ.get("APCA_API_SECRET_KEY")
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 ALPACA_WS_ENABLED = os.environ.get("ALPACA_WS_ENABLED", "0") == "1"
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 ALLOWED_CHATS = {x.strip() for x in os.environ.get("ALLOWED_CHAT_IDS", TELEGRAM_CHAT_ID).split(",") if x.strip()}
 BRIEFING = os.environ.get("MORNING_BRIEFING", "1") == "1"     # إحاطة قبل الافتتاح
