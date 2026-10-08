@@ -61,6 +61,7 @@ _live_bars = {}
 _live_ws = {"state": "disabled", "last_trade": None, "error": ""}
 _data_meta = {"source": "unknown", "last_ok": None, "last_error": "", "bars": 0}
 _scan_status = {"at": None, "result": "never", "reason": "لم تبدأ دورة الفحص بعد", "symbol": "SPY"}
+_monitor_heartbeat = None
 BAR_MINUTES = 5
 PRIMARY_LIVE_SYMBOL = "SPY"
 
@@ -2246,7 +2247,9 @@ def health():
         live = dict(_live_ws)
     live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
                                    if live.get("last_trade") else None)
-    return jsonify({"status": "ok", "bot": "tdawll-v3.4", "focus": state["focus"], "timeframe": "5m",
+    return jsonify({"status": "ok", "bot": "tdawll-v3.5-groq-monitor", "version": "b1fa9c1", "focus": state["focus"], "timeframe": "5m",
+                    "monitor": {"heartbeat": _monitor_heartbeat,
+                                "age_sec": round(time.time() - _monitor_heartbeat, 1) if _monitor_heartbeat else None},
                     "data_primary": "alpaca_rest_snapshot" if not ALPACA_WS_ENABLED else "alpaca_iex_websocket",
                     "data_fallback": "yahoo_chart", "alpaca_ws_enabled": ALPACA_WS_ENABLED,
                     "alpaca_configured": bool(ALPACA_KEY and ALPACA_SECRET),
@@ -2285,6 +2288,7 @@ def bt_loop():
 
 
 def monitor():
+    global _monitor_heartbeat
     time.sleep(8)
     log.info("monitor started: poll=%ss focus=%s", SCAN_POLL, state["focus"])
     try:
@@ -2300,6 +2304,7 @@ def monitor():
     last_bar, briefed = None, None
     while True:
         try:
+            _monitor_heartbeat = time.time()
             n = now_et(); sess, _ = session_info(n)
             if _scan_status.get("at") is None:
                 _scan_set("waiting", f"المراقب يعمل؛ بانتظار شمعة 5 دقائق مغلقة ({sess})")
