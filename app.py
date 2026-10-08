@@ -293,14 +293,14 @@ def _alpaca_headers():
     return {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
 
-def alpaca_candles(symbol, days=12):
-    """تاريخ 5 دقائق من Alpaca على feed=iex المجاني."""
+def alpaca_candles(symbol, days=12, interval="5m"):
+    """تاريخ Alpaca IEX المجاني: 5Min أو 1Day حسب طلب المحرك."""
     if not ALPACA_KEY or not ALPACA_SECRET:
         return None
     try:
         end = datetime.now(ZoneInfo("UTC")); start = end - pd.Timedelta(days=days)
         r = requests.get(f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars", headers=_alpaca_headers(),
-                         params={"timeframe": "5Min", "start": start.isoformat(), "end": end.isoformat(),
+                         params={"timeframe": "5Min" if interval == "5m" else "1Day", "start": start.isoformat(), "end": end.isoformat(),
                                  "feed": "iex", "adjustment": "raw", "limit": 10000, "sort": "asc"}, timeout=15)
         if not r.ok:
             err = f"Alpaca bars HTTP {r.status_code}: {r.text[:140]}"
@@ -432,7 +432,7 @@ def candles(symbol, interval="5m", rng="60d"):
     """Alpaca IEX فقط؛ لا يوجد fallback لبيانات متأخرة أو غير متسقة."""
     def go():
         days = 12 if interval == "5m" else 365
-        df = alpaca_candles(symbol, days=days)
+        df = alpaca_candles(symbol, days=days, interval=interval)
         if df is not None:
             _data_meta.update(source="alpaca_iex", last_ok=time.time(), last_error="", bars=len(df))
         else:
