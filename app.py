@@ -2212,7 +2212,7 @@ def health():
         live = dict(_live_ws)
     live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
                                    if live.get("last_trade") else None)
-    return jsonify({"status": "ok", "bot": "tdawll-v3.5-groq-monitor", "version": "0d70d3f", "focus": state["focus"], "timeframe": "5m",
+    return jsonify({"status": "ok", "bot": "tdawll-v3.5-groq-monitor", "version": "groq-only", "focus": state["focus"], "timeframe": "5m",
                     "monitor": {"heartbeat": _monitor_heartbeat,
                                 "age_sec": round(time.time() - _monitor_heartbeat, 1) if _monitor_heartbeat else None},
                     "data_primary": "alpaca_rest_snapshot" if not ALPACA_WS_ENABLED else "alpaca_iex_websocket",

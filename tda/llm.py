@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 طبقة LLM متعددة المزودين للبوت.
-الأولوية الافتراضية: Groq المجاني (إن وُجد مفتاحه) ثم OpenRouter ثم Gemini.
+المحرك الوحيد: Groq المجاني. لا يوجد انتقال إلى Gemini أو OpenRouter.
 كل مزود اختياري؛ لا يتم تسجيل المفاتيح أو كشفها في الردود.
 
 الإضافات على النسخة السابقة:
@@ -18,7 +18,7 @@ log = logging.getLogger("tdawll.llm")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-PROVIDER_ORDER = [x.strip().lower() for x in os.environ.get("LLM_PROVIDER_ORDER", "groq,openrouter,gemini").split(",") if x.strip()]
+PROVIDER_ORDER = ["groq"]
 GROQ_FAST = [m.strip() for m in os.environ.get("GROQ_FAST_MODELS", "qwen/qwen3.8-27b,openai/gpt-oss-120b").split(",") if m.strip()]
 GROQ_DEEP = [m.strip() for m in os.environ.get("GROQ_DEEP_MODELS", "qwen/qwen3.8-27b,openai/gpt-oss-120b").split(",") if m.strip()]
 OPENROUTER_MODELS = [m.strip() for m in os.environ.get("OPENROUTER_MODELS", "").split(",") if m.strip()]
@@ -111,7 +111,7 @@ def _compatible_generate(provider, key, models, system, contents, deep, tokens, 
         if schema:
             body["response_format"] = {"type": "json_object"}
         try:
-            r = requests.post(url, headers=headers, json=body, timeout=45)
+            r = requests.post(url, headers=headers, json=body, timeout=20)
             if r.status_code == 200:
                 data = r.json(); choices = data.get("choices", [])
                 txt = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
@@ -139,9 +139,9 @@ def generate(system, contents, deep=False, tokens=500, schema=None, temperature=
             continue
         if txt:
             return txt
-    if not GEMINI_API_KEY:
-        stats["fail"] += 1
-        return None
+    # Groq-only by design: do not wait for or call another provider.
+    stats["fail"] += 1
+    return None
     budget = 1024 if deep else 0
     base = {"temperature": temperature, "topP": 0.9}
     if schema:
@@ -188,8 +188,6 @@ def generate(system, contents, deep=False, tokens=500, schema=None, temperature=
 def provider_status():
     configured = []
     if GROQ_API_KEY: configured.append("groq")
-    if OPENROUTER_API_KEY and OPENROUTER_MODELS: configured.append("openrouter")
-    if GEMINI_API_KEY: configured.append("gemini")
     return {"order": PROVIDER_ORDER, "configured": configured, "calls": stats["calls"], "failures": stats["fail"]}
 
 def user_msg(text):
