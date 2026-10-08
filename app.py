@@ -865,6 +865,30 @@ def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
     return "❌ تعذّر توليد الإجابة (حد الاستخدام أو خلل مؤقت). جرّب بعد قليل."
 
 
+def local_expectation(S):
+    """رد احتياطي فوري لا يعتمد على Gemini؛ يستخدم أرقام البطاقة الحالية فقط."""
+    l, p = S["l"], S.get("plan")
+    score = int(S.get("score", 0)); direction = int(S.get("dir", 0))
+    trend = "صاعد" if l["EMA9"] > l["EMA21"] else "هابط"
+    side = "شراء" if direction > 0 else "بيع" if direction < 0 else "انتظار"
+    if direction > 0:
+        view = "الأرجح استمرار الصعود ما دام السعر فوق VWAP وEMA21"
+        invalid = f"إبطال السيناريو بكسر EMA21 عند {l['EMA21']:.2f} ثم VWAP عند {l['VWAP']:.2f}"
+    elif direction < 0:
+        view = "الأرجح استمرار الضغط الهابط ما دام السعر تحت VWAP وEMA21"
+        invalid = f"إبطال السيناريو باختراق EMA21 عند {l['EMA21']:.2f} ثم VWAP عند {l['VWAP']:.2f}"
+    else:
+        view = "لا توجد أفضلية واضحة الآن؛ الأفضل انتظار اختراق مؤكد"
+        invalid = f"راقب اختراق EMA21 عند {l['EMA21']:.2f} أو كسر VWAP عند {l['VWAP']:.2f}"
+    out = ["🧠 <b>التوقع الفني الاحتياطي — فريم 5 دقائق</b>",
+           f"الاتجاه اللحظي: <b>{trend}</b> · نتيجة القواعد: <b>{score:+d}/100</b> · القرار: <b>{side}</b>",
+           f"{view}. السعر {S['price']:.2f}، RSI {l['RSI']:.0f}، وMACD {'موجب' if l['MACD_H'] > 0 else 'سالب'}.",
+           invalid]
+    if p and direction:
+        out.append(f"الخطة المحسوبة: دخول {p['entry']:.2f} · وقف {p['stop']:.2f} · هدف1 {p['t1']:.2f} · هدف2 {p['t2']:.2f}.")
+    out.append("هذا رد محلي من المؤشرات وليس ضمانًا؛ لا تدخل قبل إغلاق شمعة 5 دقائق وتحقق الحجم.")
+    return "\n".join(out)
+
 # ============================== محرك اقتناص الفرص (فريم 5 دقائق) ==============================
 GRADE_MIN = {"A": 75, "B": 62, "C": 48}
 GRADE_RANK = {"A": 3, "B": 2, "C": 1}
@@ -1719,6 +1743,8 @@ def h_analyze(chat, task=None, title="🧠"):
     ans = brain(task or "اكتب تحليلاً مهنياً من 5 إلى 7 أسطر بالترتيب: (1) الصورة العامة والتعارض بين الفريمات إن وُجد "
                         "(2) الزخم والتشبع (3) أقرب دعمين ومقاومتين من البطاقة (4) السيناريو الأرجح وشرط إبطاله "
                         "(5) ما يجب مراقبته (VIX/خبر/مستوى). استخدم مزاج المتداولين والأسواق التنبؤية إن كانت متاحة.", card_text(S, True, ext=True), chat, deep=True, tokens=650, memo="طلب تحليل شامل")
+    if not ans or ans.startswith(("❌", "⚠️")):
+        ans = local_expectation(S)
     out = f"{title} {head(S)}\n📐 {DIR_TXT[S['dir']]} ({S['score']:+d}/100)\n🤖 {html.escape(ml_line(S))}\n\n{fmt_ai(ans)}"
     if S.get("plan"):
         p = S["plan"]
@@ -1751,6 +1777,8 @@ def h_free(chat, text):
     S = snapshot()
     ans = brain(f"سؤال المستخدم: {text}\nأجب في 2 إلى 5 أسطر إلا إذا طلب تفصيلاً. إن كان السؤال خارج نطاق السوق فاعتذر بسطر.",
                 card_text(S, True, ext=True) if S else None, chat, deep=len(text) > 60, tokens=450, memo=text)
+    if S and (not ans or ans.startswith(("❌", "⚠️"))):
+        ans = local_expectation(S)
     tg_text(fmt_ai(ans), chat, keyboard())
 
 
