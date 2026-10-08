@@ -2206,6 +2206,7 @@ def webhook():
 @app.route("/health")
 @app.route("/data_status")
 def health():
+    ensure_monitor()
     s, t = session_info()
     with _live_lock:
         live = dict(_live_ws)
@@ -2250,6 +2251,14 @@ def bt_loop():
         except Exception: log.exception("backtest")
         time.sleep(6 * 3600)
 
+
+MONITOR_THREAD_NAME = "tdawll-monitor"
+def ensure_monitor():
+    alive = any(t.name == MONITOR_THREAD_NAME and t.is_alive() for t in threading.enumerate())
+    if not alive:
+        log.warning("monitor thread missing; starting watchdog recovery")
+        threading.Thread(target=monitor, name=MONITOR_THREAD_NAME, daemon=True).start()
+    return alive
 
 def monitor():
     global _monitor_heartbeat
