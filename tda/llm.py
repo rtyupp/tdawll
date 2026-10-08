@@ -81,15 +81,19 @@ def generate(system, contents, deep=False, tokens=500, schema=None, temperature=
     budget = 1024 if deep else 0
     base = {"temperature": temperature, "topP": 0.9}
     if schema:
-        cfgs = [
-            {**base, "maxOutputTokens": tokens + budget, "thinkingConfig": {"thinkingBudget": budget},
-             "responseMimeType": "application/json", "responseSchema": schema},
-            {**base, "maxOutputTokens": tokens + 600, "responseMimeType": "application/json", "responseSchema": schema},
-            {**base, "maxOutputTokens": tokens + 600, "responseMimeType": "application/json"},   # بدون schema
-        ]
+        cfgs = []
+        if deep:
+            cfgs.append({**base, "maxOutputTokens": tokens + budget,
+                         "thinkingConfig": {"thinkingBudget": budget},
+                         "responseMimeType": "application/json", "responseSchema": schema})
+        cfgs += [{**base, "maxOutputTokens": tokens + 600,
+                  "responseMimeType": "application/json", "responseSchema": schema},
+                 {**base, "maxOutputTokens": tokens + 600,
+                  "responseMimeType": "application/json"}]
     else:
-        cfgs = [{**base, "maxOutputTokens": tokens + budget, "thinkingConfig": {"thinkingBudget": budget}},
-                {**base, "maxOutputTokens": tokens + 600}]
+        cfgs = ([{**base, "maxOutputTokens": tokens + budget,
+                  "thinkingConfig": {"thinkingBudget": budget}}] if deep else [])
+        cfgs.append({**base, "maxOutputTokens": tokens + 600})
     for mdl in (DEEP_MODELS if deep else FAST_MODELS):
         for ci, cfg in enumerate(cfgs):
             _throttle()

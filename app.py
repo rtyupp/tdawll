@@ -337,18 +337,44 @@ def _live_trade_message(_, message):
             for tick in obj.get("data", []):
                 if tick.get("s") != PRIMARY_LIVE_SYMBOL: continue
                 price, volume, stamp = float(tick["p"]), float(tick.get("v", 0) or 0), float(tick["t"]) / 1000
-                dt = datetime.fromtimestamp(stamp, NY).replace(tzinfo=None)
-                minute = (dt.minute // BAR_MINUTES) * BAR_MINUTES
-                ix = dt.replace(minute=minute, second=0, microsecond=0)
-                b = _live_bars.get(PRIMARY_LIVE_SYMBOL)
-                if not b or b["ts"] != ix:
-                    b = {"ts": ix, "Open": price, "High": price, "Low": price, "Close": price, "Volume": 0.0}
-                    _live_bars[PRIMARY_LIVE_SYMBOL] = b
-                b["High"] = max(b["High"], price); b["Low"] = min(b["Low"], price)
-                b["Close"] = price; b["Volume"] += volume
-                _live_ws["last_trade"] = stamp; _live_ws["state"] = "connected"
+                _record_live_tick(price, volume, stamp, "finnhub_ws")
     except Exception as e:
         log.debug("finnhub websocket message: %s", e)
+
+
+def _record_live_tick(price, volume=0.0, stamp=None, source="finnhub"):
+    stamp = float(stamp or time.time())
+    dt = datetime.fromtimestamp(stamp, NY).replace(tzinfo=None)
+    minute = (dt.minute // BAR_MINUTES) * BAR_MINUTES
+    ix = dt.replace(minute=minute, second=0, microsecond=0)
+    with _live_lock:
+        b = _live_bars.get(PRIMARY_LIVE_SYMBOL)
+        if not b or b["ts"] != ix:
+            b = {"ts": ix, "Open": price, "High": price, "Low": price, "Close": price, "Volume": 0.0}
+            _live_bars[PRIMARY_LIVE_SYMBOL] = b
+        b["High"] = max(b["High"], price); b["Low"] = min(b["Low"], price)
+        b["Close"] = price; b["Volume"] += volume
+        _live_ws["last_trade"] = stamp; _live_ws["state"] = f"{source}_connected"; _live_ws["error"] = ""
+
+
+def _live_quote_loop():
+    """مصدر مجاني قريب من اللحظي: Finnhub Quote كل 15 ثانية، ويستمر لو فشل WebSocket."""
+    if not FINNHUB_KEY:
+        return
+    while True:
+        try:
+            r = requests.get("https://finnhub.io/api/v1/quote",
+                             params={"symbol": PRIMARY_LIVE_SYMBOL, "token": FINNHUB_KEY}, timeout=10)
+            q = r.json() if r.ok else {}
+            price, stamp = q.get("c"), q.get("t") or time.time()
+            if price and float(price) > 0:
+                _record_live_tick(float(price), 0.0, stamp, "finnhub_quote")
+            else:
+                with _live_lock: _live_ws["error"] = f"quote HTTP {r.status_code} أو بلا سعر"
+        except Exception as e:
+            with _live_lock: _live_ws["error"] = str(e)[:180]
+            log.warning("finnhub quote: %s", e)
+        time.sleep(15)
 
 
 def _live_ws_error(_, error):
@@ -1522,7 +1548,7 @@ def h_commands(chat, arg=""):
 def h_data_status(chat, arg=""):
     with _live_lock: live = dict(_live_ws)
     age = (time.time() - live["last_trade"] if live.get("last_trade") else None)
-    msg = (f"📡 <b>حالة البيانات</b>\nالمصدر الأساسي: Finnhub WebSocket\n"
+    msg = (f"📡 <b>حالة البيانات</b>\nالمصدر الأساسي: Finnhub WebSocket + Quote كل 15 ثانية\n"
            f"الحالة: <b>{live.get('state')}</b>\n"
            f"آخر Tick: {f'قبل {age:.1f} ثانية' if age is not None else 'لا يوجد بعد'}\n"
            f"مصدر الشموع: <b>{_data_meta.get('source')}</b> · عددها {_data_meta.get('bars', 0)}\n"
@@ -1974,6 +2000,31 @@ ROUTES = {"commands": h_commands, "data_status": h_data_status, "why_no_signal":
 ARG_ROUTES = {"start": h_start, "help": h_start, "commands": h_commands, "panel": h_panel, "channel": h_channel, "risk": h_risk, "alert": h_alert, "grade": h_grade, "debate": h_debate, "pos": h_pos, "gate": h_gate}
 
 
+BUTTON_INTENTS = (
+    (("الأزرار", "الازرار", "لوحة الأزرار", "لوحه الازرار", "زر التحكم", "قائمة الأزرار"), h_panel),
+    (("زر السعر", "زر الاسعار", "زر الأسعار", "السعر الآن", "السعر الحين"), h_price),
+    (("زر المستويات", "زر الدعم", "زر المقاومة", "الدعوم والمقاومات", "المستويات"), h_levels),
+    (("زر الشارت", "زر الرسم", "الرسم البياني", "الشارت"), h_chart),
+    (("زر الأخبار", "زر الاخبار", "الأخبار", "الاخبار"), h_news),
+    (("زر التحليل", "التحليل الذكي", "حلل لي"), h_analyze),
+    (("زر الفرص", "الفرص", "اقتناس الفرص", "اقتناص الفرص"), h_scan),
+    (("زر الإحصائيات", "زر الاحصائيات", "الإحصائيات", "الاحصائيات"), h_stats),
+)
+
+
+def natural_button(text, chat):
+    """يفهم طلبات الأزرار العربية بدون استهلاك حصة Gemini."""
+    t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not any(k in t for k in ("زر", "الأزرار", "الازرار", "لوحة", "أرسل", "ارسل", "ابغى", "ابي")):
+        return False
+    for phrases, fn in BUTTON_INTENTS:
+        if any(p in t for p in phrases):
+            fn(chat)
+            return True
+    h_panel(chat)
+    return True
+
+
 def handle(text, chat):
     t = (text or "").strip()
     parts = t.lstrip("/").split(None, 1)
@@ -1984,6 +2035,8 @@ def handle(text, chat):
         return ARG_ROUTES[cmd](chat, arg)
     if is_cmd and cmd in ROUTES:
         return ROUTES[cmd](chat)
+    if natural_button(t, chat):
+        return None
     return h_free(chat, t)
 
 
@@ -2101,7 +2154,7 @@ def health():
     live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
                                    if live.get("last_trade") else None)
     return jsonify({"status": "ok", "bot": "tdawll-v3.4", "focus": state["focus"], "timeframe": "5m",
-                    "data_primary": "finnhub_websocket", "data_fallback": "yahoo_chart",
+                    "data_primary": "finnhub_ws_or_quote", "data_fallback": "yahoo_chart",
                     "live": live, "data": dict(_data_meta), "last_scan": dict(_scan_status), "session": s,
                     "uptime_min": int((time.time() - _started) / 60), "time_et": now_et().strftime("%H:%M:%S")})
 
@@ -2172,6 +2225,7 @@ def boot():
     _booted = True
     load_state()
     threading.Thread(target=_live_ws_loop, daemon=True).start()
+    threading.Thread(target=_live_quote_loop, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
 
 
