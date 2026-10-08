@@ -32,7 +32,10 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()          # @اسم_القناة أو -100xxxxxxxxxx
 PUBLIC_BOT = os.environ.get("PUBLIC_BOT", "0") == "1"           # افتراضياً: البوت لك وحدك. 1 = يسمح لأي زائر بأوامر القراءة فقط
-FINNHUB_KEY = os.environ.get("FINNHUB_KEY")
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY")  # الأخبار القديمة فقط
+ALPACA_KEY = os.environ.get("ALPACA_KEY") or os.environ.get("APCA_API_KEY_ID")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET") or os.environ.get("APCA_API_SECRET_KEY")
+ALPACA_DATA_URL = "https://data.alpaca.markets"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 ALLOWED_CHATS = {x.strip() for x in os.environ.get("ALLOWED_CHAT_IDS", TELEGRAM_CHAT_ID).split(",") if x.strip()}
@@ -311,38 +314,33 @@ def _overlay_live_bar(df, symbol):
     return out.sort_index()
 
 
-def finnhub_candles(symbol, res="5", days=12):
-    """المصدر الرئيسي للشموع: Finnhub؛ جودة اللحظة تعتمد على صلاحية FINNHUB_KEY."""
-    if not FINNHUB_KEY:
+def _alpaca_headers():
+    return {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+
+
+def alpaca_candles(symbol, days=12):
+    """تاريخ 5 دقائق من Alpaca على feed=iex المجاني."""
+    if not ALPACA_KEY or not ALPACA_SECRET:
         return None
     try:
-        to = int(time.time()); frm = to - days * 86400
-        j = requests.get("https://finnhub.io/api/v1/stock/candle",
-                         params={"symbol": symbol, "resolution": res, "from": frm, "to": to, "token": FINNHUB_KEY},
-                         timeout=15).json()
-        if j.get("s") != "ok" or not j.get("c"):
-            return None
-        idx = pd.to_datetime(j["t"], unit="s", utc=True).tz_convert(NY).tz_localize(None)
-        return _overlay_live_bar(pd.DataFrame({"Open": j["o"], "High": j["h"], "Low": j["l"], "Close": j["c"], "Volume": j["v"]}, index=idx), symbol)
+        end = datetime.now(ZoneInfo("UTC")); start = end - pd.Timedelta(days=days)
+        r = requests.get(f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars", headers=_alpaca_headers(),
+                         params={"timeframe": "5Min", "start": start.isoformat(), "end": end.isoformat(),
+                                 "feed": "iex", "adjustment": "raw", "limit": 10000, "sort": "asc"}, timeout=15)
+        if not r.ok:
+            log.warning("alpaca bars HTTP%s: %s", r.status_code, r.text[:160]); return None
+        bars = r.json().get("bars") or []
+        if not bars: return None
+        idx = pd.to_datetime([x["t"] for x in bars], utc=True).tz_convert(NY).tz_localize(None)
+        df = pd.DataFrame({"Open": [x["o"] for x in bars], "High": [x["h"] for x in bars],
+                           "Low": [x["l"] for x in bars], "Close": [x["c"] for x in bars],
+                           "Volume": [x.get("v", 0) for x in bars]}, index=idx)
+        return _overlay_live_bar(df, symbol)
     except Exception as e:
-        log.warning("finnhub candle err: %s", e)
-        return None
+        log.warning("alpaca bars err: %s", e); return None
 
 
-def _live_trade_message(_, message):
-    try:
-        obj = json.loads(message)
-        if obj.get("type") != "trade": return
-        with _live_lock:
-            for tick in obj.get("data", []):
-                if tick.get("s") != PRIMARY_LIVE_SYMBOL: continue
-                price, volume, stamp = float(tick["p"]), float(tick.get("v", 0) or 0), float(tick["t"]) / 1000
-                _record_live_tick(price, volume, stamp, "finnhub_ws")
-    except Exception as e:
-        log.debug("finnhub websocket message: %s", e)
-
-
-def _record_live_tick(price, volume=0.0, stamp=None, source="finnhub"):
+def _record_live_tick(price, volume=0.0, stamp=None, source="alpaca"):
     stamp = float(stamp or time.time())
     dt = datetime.fromtimestamp(stamp, NY).replace(tzinfo=None)
     minute = (dt.minute // BAR_MINUTES) * BAR_MINUTES
@@ -357,67 +355,76 @@ def _record_live_tick(price, volume=0.0, stamp=None, source="finnhub"):
         _live_ws["last_trade"] = stamp; _live_ws["state"] = f"{source}_connected"; _live_ws["error"] = ""
 
 
-def _live_quote_loop():
-    """مصدر مجاني قريب من اللحظي: Finnhub Quote كل 15 ثانية، ويستمر لو فشل WebSocket."""
-    if not FINNHUB_KEY:
-        return
-    while True:
-        try:
-            r = requests.get("https://finnhub.io/api/v1/quote",
-                             params={"symbol": PRIMARY_LIVE_SYMBOL, "token": FINNHUB_KEY}, timeout=10)
-            q = r.json() if r.ok else {}
-            price, stamp = q.get("c"), q.get("t") or time.time()
-            if price and float(price) > 0:
-                _record_live_tick(float(price), 0.0, stamp, "finnhub_quote")
-            else:
-                with _live_lock: _live_ws["error"] = f"quote HTTP {r.status_code} أو بلا سعر"
-        except Exception as e:
-            with _live_lock: _live_ws["error"] = str(e)[:180]
-            log.warning("finnhub quote: %s", e)
-        time.sleep(15)
+def _alpaca_message(_, message):
+    try:
+        payload = json.loads(message)
+        for obj in payload if isinstance(payload, list) else [payload]:
+            typ = obj.get("T")
+            if typ == "t" and obj.get("S") == PRIMARY_LIVE_SYMBOL:
+                ts = pd.Timestamp(obj["t"]).timestamp()
+                _record_live_tick(float(obj["p"]), float(obj.get("s", 0) or 0), ts, "alpaca_ws")
+            elif typ == "error":
+                with _live_lock: _live_ws.update(state="error", error=str(obj.get("msg", "Alpaca error"))[:180])
+    except Exception as e:
+        log.debug("alpaca websocket message: %s", e)
 
 
-def _live_ws_error(_, error):
-    with _live_lock:
-        _live_ws.update(state="error", error=str(error)[:180])
-    log.warning("finnhub websocket: %s", error)
-
-
-def _live_ws_loop():
-    if not FINNHUB_KEY or websocket is None:
+def _alpaca_ws_loop():
+    if not ALPACA_KEY or not ALPACA_SECRET or websocket is None:
         with _live_lock: _live_ws["state"] = "unavailable"
-        log.warning("live source unavailable: FINNHUB_KEY or websocket-client missing")
+        log.warning("live source unavailable: ALPACA_KEY/ALPACA_SECRET or websocket-client missing")
         return
     while True:
         try:
             with _live_lock: _live_ws["state"] = "connecting"
-            ws = websocket.WebSocketApp(
-                "wss://ws.finnhub.io?token=" + FINNHUB_KEY,
-                on_open=lambda sock: (sock.send(json.dumps({"type": "subscribe", "symbol": PRIMARY_LIVE_SYMBOL})),
-                                      log.info("Finnhub live WebSocket subscribed: %s", PRIMARY_LIVE_SYMBOL)),
-                on_message=_live_trade_message, on_error=_live_ws_error)
+            def opened(sock):
+                sock.send(json.dumps({"action": "auth", "key": ALPACA_KEY, "secret": ALPACA_SECRET}))
+                time.sleep(0.3)
+                sock.send(json.dumps({"action": "subscribe", "trades": [PRIMARY_LIVE_SYMBOL]}))
+                log.info("Alpaca IEX WebSocket subscribed: %s", PRIMARY_LIVE_SYMBOL)
+            ws = websocket.WebSocketApp("wss://stream.data.alpaca.markets/v2/iex",
+                                        on_open=opened, on_message=_alpaca_message,
+                                        on_error=_live_ws_error)
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             _live_ws_error(None, e)
         time.sleep(5)
 
 
+def _alpaca_quote_loop():
+    """نبض REST مجاني احتياطي من آخر صفقة IEX كل 15 ثانية."""
+    if not ALPACA_KEY or not ALPACA_SECRET: return
+    while True:
+        try:
+            r = requests.get(f"{ALPACA_DATA_URL}/v2/stocks/{PRIMARY_LIVE_SYMBOL}/trades/latest",
+                             headers=_alpaca_headers(), params={"feed": "iex"}, timeout=10)
+            j = r.json() if r.ok else {}; tr = j.get("trade") or {}
+            if tr.get("p") and tr.get("t"):
+                _record_live_tick(float(tr["p"]), float(tr.get("s", 0) or 0), pd.Timestamp(tr["t"]).timestamp(), "alpaca_rest")
+            elif not r.ok:
+                with _live_lock: _live_ws["error"] = f"Alpaca REST HTTP {r.status_code}"
+        except Exception as e:
+            with _live_lock: _live_ws["error"] = str(e)[:180]
+        time.sleep(15)
+
+
+def _live_ws_error(_, error):
+    with _live_lock: _live_ws.update(state="error", error=str(error)[:180])
+    log.warning("alpaca websocket: %s", error)
+
+
 def candles(symbol, interval="5m", rng="60d"):
     def go():
-        # Finnhub + WebSocket هو الأساسي لفريم 5 دقائق؛ Yahoo آخر احتياط.
         if symbol == PRIMARY_LIVE_SYMBOL and interval == "5m":
-            df = finnhub_candles(symbol, res="5", days=12)
+            df = alpaca_candles(symbol, days=12)
             if df is not None:
-                _data_meta.update(source="finnhub", last_ok=time.time(), last_error="", bars=len(df))
-                return df
+                _data_meta.update(source="alpaca_iex", last_ok=time.time(), last_error="", bars=len(df)); return df
         df = yahoo_candles(symbol, interval, rng)
         if df is not None:
             _data_meta.update(source="yahoo_fallback", last_ok=time.time(), last_error="", bars=len(df))
-        else:
-            _data_meta.update(last_error=f"لا بيانات لـ {symbol} {interval}")
+        else: _data_meta.update(last_error=f"لا بيانات لـ {symbol} {interval}")
         return df
     return cached(f"c:{symbol}:{interval}:{rng}", 20 if interval != "1d" else 600, go)
-
 
 NEWS_KW = re.compile(r"\b(fed|powell|fomc|inflation|cpi|ppi|pce|jobs|payroll|unemployment|rates?|yields?|treasur\w*|tariffs?|"
                      r"s&p|stocks?|wall street|nasdaq|dow|earnings|recession|gdp|oil|economy|economic|market\w*|"
@@ -1548,7 +1555,7 @@ def h_commands(chat, arg=""):
 def h_data_status(chat, arg=""):
     with _live_lock: live = dict(_live_ws)
     age = (time.time() - live["last_trade"] if live.get("last_trade") else None)
-    msg = (f"📡 <b>حالة البيانات</b>\nالمصدر الأساسي: Finnhub WebSocket + Quote كل 15 ثانية\n"
+    msg = (f"📡 <b>حالة البيانات</b>\nالمصدر الأساسي: Alpaca IEX WebSocket + REST كل 15 ثانية\n"
            f"الحالة: <b>{live.get('state')}</b>\n"
            f"آخر Tick: {f'قبل {age:.1f} ثانية' if age is not None else 'لا يوجد بعد'}\n"
            f"مصدر الشموع: <b>{_data_meta.get('source')}</b> · عددها {_data_meta.get('bars', 0)}\n"
@@ -2154,7 +2161,8 @@ def health():
     live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
                                    if live.get("last_trade") else None)
     return jsonify({"status": "ok", "bot": "tdawll-v3.4", "focus": state["focus"], "timeframe": "5m",
-                    "data_primary": "finnhub_ws_or_quote", "data_fallback": "yahoo_chart",
+                    "data_primary": "alpaca_iex_ws_or_rest", "data_fallback": "yahoo_chart",
+                    "alpaca_configured": bool(ALPACA_KEY and ALPACA_SECRET),
                     "live": live, "data": dict(_data_meta), "last_scan": dict(_scan_status), "session": s,
                     "uptime_min": int((time.time() - _started) / 60), "time_et": now_et().strftime("%H:%M:%S")})
 
@@ -2224,8 +2232,8 @@ def boot():
     if _booted: return
     _booted = True
     load_state()
-    threading.Thread(target=_live_ws_loop, daemon=True).start()
-    threading.Thread(target=_live_quote_loop, daemon=True).start()
+    threading.Thread(target=_alpaca_ws_loop, daemon=True).start()
+    threading.Thread(target=_alpaca_quote_loop, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
 
 
