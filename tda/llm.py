@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-طبقة Gemini الوحيدة في البوت. لا تغيّر النموذج: نفس النماذج ونفس المفتاح (GEMINI_API_KEY)،
-والأسماء قابلة للضبط بنفس المتغيرات القديمة (GEMINI_FAST / GEMINI_DEEP).
+طبقة LLM متعددة المزودين للبوت.
+الأولوية الافتراضية: Groq المجاني (إن وُجد مفتاحه) ثم OpenRouter ثم Gemini.
+كل مزود اختياري؛ لا يتم تسجيل المفاتيح أو كشفها في الردود.
 
 الإضافات على النسخة السابقة:
   - مخرجات JSON منظمة (responseSchema) مع تراجع تلقائي إن لم يدعمها النموذج.
@@ -15,6 +16,12 @@ import requests
 log = logging.getLogger("tdawll.llm")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+PROVIDER_ORDER = [x.strip().lower() for x in os.environ.get("LLM_PROVIDER_ORDER", "groq,openrouter,gemini").split(",") if x.strip()]
+GROQ_FAST = [m.strip() for m in os.environ.get("GROQ_FAST_MODELS", "qwen/qwen3.8-27b,openai/gpt-oss-120b").split(",") if m.strip()]
+GROQ_DEEP = [m.strip() for m in os.environ.get("GROQ_DEEP_MODELS", "qwen/qwen3.8-27b,openai/gpt-oss-120b").split(",") if m.strip()]
+OPENROUTER_MODELS = [m.strip() for m in os.environ.get("OPENROUTER_MODELS", "").split(",") if m.strip()]
 FAST_MODELS = [m.strip() for m in os.environ.get("GEMINI_FAST", "gemini-flash-lite-latest,gemini-flash-latest").split(",") if m.strip()]
 DEEP_MODELS = [m.strip() for m in os.environ.get("GEMINI_DEEP", "gemini-flash-latest,gemini-2.5-flash,gemini-flash-lite-latest").split(",") if m.strip()]
 RPM = int(os.environ.get("LLM_RPM", "9"))            # أقصى طلبات في الدقيقة (الحصة المجانية محدودة)
@@ -74,9 +81,66 @@ def extract_json(text):
     return None
 
 
+def _openai_messages(system, contents):
+    msgs = [{"role": "system", "content": system}]
+    for m in contents:
+        role = "assistant" if m.get("role") == "model" else m.get("role", "user")
+        text = "".join(p.get("text", "") for p in m.get("parts", []) if isinstance(p, dict))
+        if text:
+            msgs.append({"role": role, "content": text})
+    return msgs
+
+def _compatible_generate(provider, key, models, system, contents, deep, tokens, schema, temperature):
+    if not key or not models:
+        return None
+    messages = _openai_messages(system, contents)
+    for mdl in models:
+        _throttle(); stats["calls"] += 1
+        body = {"model": mdl, "messages": messages, "temperature": temperature,
+                "max_completion_tokens": max(64, tokens + (700 if deep else 350)),
+                "stream": False}
+        if provider == "groq":
+            body.update({"reasoning_effort": "medium" if deep else "none", "include_reasoning": False})
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        else:
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                       "HTTP-Referer": os.environ.get("OPENROUTER_REFERER", "https://spy-bot-live.onrender.com"),
+                       "X-OpenRouter-Title": "SPY 5m Arabic Analyst"}
+        if schema:
+            body["response_format"] = {"type": "json_object"}
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=45)
+            if r.status_code == 200:
+                data = r.json(); choices = data.get("choices", [])
+                txt = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+                if txt: return txt
+                log.warning("%s EMPTY %s", provider, mdl)
+            else:
+                log.warning("%s HTTP%s %s: %s", provider, r.status_code, mdl, r.text[:160])
+                if r.status_code == 429:
+                    time.sleep(1.0)
+        except Exception as e:
+            log.warning("%s EXC %s: %s", provider, mdl, str(e)[:120])
+    return None
+
 def generate(system, contents, deep=False, tokens=500, schema=None, temperature=0.3):
     """يرجع نص النموذج أو None. contents = قائمة رسائل بصيغة Gemini REST."""
+    # OpenAI-compatible providers are tried first when their keys are configured.
+    for provider in PROVIDER_ORDER:
+        if provider == "groq":
+            txt = _compatible_generate("groq", GROQ_API_KEY, GROQ_DEEP if deep else GROQ_FAST,
+                                       system, contents, deep, tokens, schema, temperature)
+        elif provider == "openrouter":
+            txt = _compatible_generate("openrouter", OPENROUTER_API_KEY, OPENROUTER_MODELS,
+                                       system, contents, deep, tokens, schema, temperature)
+        else:
+            continue
+        if txt:
+            return txt
     if not GEMINI_API_KEY:
+        stats["fail"] += 1
         return None
     budget = 1024 if deep else 0
     base = {"temperature": temperature, "topP": 0.9}
