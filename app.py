@@ -2250,6 +2250,7 @@ def health():
                     "data_primary": "alpaca_rest_snapshot" if not ALPACA_WS_ENABLED else "alpaca_iex_websocket",
                     "data_fallback": "yahoo_chart", "alpaca_ws_enabled": ALPACA_WS_ENABLED,
                     "alpaca_configured": bool(ALPACA_KEY and ALPACA_SECRET),
+                    "llm": llm.provider_status(),
                     "live": live, "data": dict(_data_meta), "last_scan": dict(_scan_status), "session": s,
                     "uptime_min": int((time.time() - _started) / 60), "time_et": now_et().strftime("%H:%M:%S")})
 

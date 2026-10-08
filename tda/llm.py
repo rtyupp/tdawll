@@ -185,6 +185,13 @@ def generate(system, contents, deep=False, tokens=500, schema=None, temperature=
     return None
 
 
+def provider_status():
+    configured = []
+    if GROQ_API_KEY: configured.append("groq")
+    if OPENROUTER_API_KEY and OPENROUTER_MODELS: configured.append("openrouter")
+    if GEMINI_API_KEY: configured.append("gemini")
+    return {"order": PROVIDER_ORDER, "configured": configured, "calls": stats["calls"], "failures": stats["fail"]}
+
 def user_msg(text):
     return [{"role": "user", "parts": [{"text": text}]}]
 
