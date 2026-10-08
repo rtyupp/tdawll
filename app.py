@@ -1273,7 +1273,13 @@ def _scan_set(result, reason, symbol=None):
 
 
 def live_scan(force_chat=None):
-    S = snapshot(closed_only=True)
+    _scan_set("running", "بدأ فحص إشارة فريم 5 دقائق")
+    try:
+        S = snapshot(closed_only=True)
+    except Exception as e:
+        log.exception("live_scan snapshot")
+        _scan_set("error", f"استثناء أثناء تجهيز بطاقة الفحص: {str(e)[:180]}")
+        return 0
     if not S:
         _scan_set("blocked", "لا توجد بطاقة بيانات كافية")
         return 0
@@ -2262,7 +2268,11 @@ def monitor():
                         if sess == "open" and closed.index[-1] != last_bar:
                             last_bar = closed.index[-1]
                             log.info("new closed bar %s -> scan", last_bar)
-                            live_scan()
+                            try:
+                                live_scan()
+                            except Exception as e:
+                                log.exception("live_scan uncaught")
+                                _scan_set("error", f"استثناء غير معالج في الفحص: {str(e)[:180]}")
         except Exception:
             log.exception("monitor")
         time.sleep(SCAN_POLL)
