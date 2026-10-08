@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 tdawll v2 — بوت تحليل S&P 500 (SPY / SPX) على تيليجرام
-البيانات: Alpaca IEX فقط | الذكاء: Groq ثم Gemini | الاستضافة: Render المجاني
+البيانات: Alpaca IEX فقط | الذكاء: Groq فقط | الاستضافة: Render المجاني
 """
 import os, io, re, json, time, html, logging, threading
 from collections import deque
@@ -811,7 +811,7 @@ def card_text(S, with_news=True, ext=False):
     return "\n".join(lines)
 
 
-# ============================== العقل (Gemini) ==============================
+# ============================== العقل (Groq) ==============================
 def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
     if not llm.GROQ_API_KEY:
         return "⚠️ مفتاح Groq غير مضبوط."
@@ -830,7 +830,7 @@ def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
 
 
 def local_expectation(S):
-    """رد احتياطي فوري لا يعتمد على Gemini؛ يستخدم أرقام البطاقة الحالية فقط."""
+    """رد احتياطي فوري لا يعتمد على Groq؛ يستخدم أرقام البطاقة الحالية فقط."""
     l, p = S["l"], S.get("plan")
     score = int(S.get("score", 0)); direction = int(S.get("dir", 0))
     trend = "صاعد" if l["EMA9"] > l["EMA21"] else "هابط"
@@ -1308,7 +1308,7 @@ def live_scan(force_chat=None):
         return 0
     best, others = fresh[0], fresh[1:]
 
-    # لجنة التداول: ثور/دب/حكم في طلب Gemini واحد، مع دروس سابقة وموقفك الحالي
+    # لجنة التداول: ثور/دب/حكم في طلب Groq واحد، مع دروس سابقة وموقفك الحالي
     gate = settings.get("gate", "soft")
     cm = None
     if gate != "off":
@@ -1802,7 +1802,7 @@ def h_stats(chat):
             L.append("<i>هذه فرضيات من بحث الغاما: حتى تثبت هنا بعشرات الصفقات اعتبرها سياقاً لا قاعدة.</i>")
     else:
         L.append("\nلا توجد إشارات حية مكتملة بعد.")
-    L.append(f"\n🧠 دروس محفوظة: {len(lessons)} · استدعاءات Gemini منذ التشغيل: {llm.stats['calls']} (فشل {llm.stats['fail']})")
+    L.append(f"\n🧠 دروس محفوظة: {len(lessons)} · استدعاءات Groq منذ التشغيل: {llm.stats['calls']} (فشل {llm.stats['fail']})")
     if BT.get("stats"):
         L.append(f"\n<b>باكتست {BT['days']} يوم ({BT['symbol']}) — شموع 5د</b>")
         for k, v in sorted(BT["stats"].items(), key=lambda kv: -kv[1]["avgR"]):
@@ -1888,7 +1888,7 @@ def h_sentiment(chat):
         out.append(f"\n<b>{agents.BAND_AR.get(rep_['overall_band'], rep_['overall_band'])}</b> · {float(rep_['overall_score']):.1f}/10 · "
                    f"{agents.CONF_AR.get(rep_.get('confidence'), '')}\n{fmt_ai(rep_['narrative'])}")
     else:
-        out.append("\n⚠️ تعذّر توليد تقرير المزاج (Gemini). هذه البيانات الخام:")
+        out.append("\n⚠️ تعذّر توليد تقرير المزاج (Groq). هذه البيانات الخام:")
     out.append("\n" + html.escape("\n".join(x for x in lines if not x.startswith("  "))))
     tg_text("\n".join(out), chat, keyboard())
 
@@ -1938,7 +1938,7 @@ def h_gate(chat, arg=""):
     g = (arg or "").strip().lower()
     if g not in ("soft", "hard", "off"):
         return tg_text(f"البوابة الحالية: <b>{settings.get('gate', 'soft')}</b>\n• soft: تُرسل كل الفرص وتُوسم إن عارضتها اللجنة\n"
-                       "• hard: الفرصة التي تعارضها اللجنة لا تُرسل (لكن تُسجَّل لنقيس صحة الفيتو)\n• off: بدون لجنة على التنبيهات (يوفر حصة Gemini)",
+                       "• hard: الفرصة التي تعارضها اللجنة لا تُرسل (لكن تُسجَّل لنقيس صحة الفيتو)\n• off: بدون لجنة على التنبيهات (يوفر حصة Groq)",
                        chat, keyboard())
     settings["gate"] = g; save_state()
     tg_text(f"✅ بوابة اللجنة: <b>{g}</b>", chat, keyboard())
@@ -2070,7 +2070,7 @@ BUTTON_INTENTS = (
 
 
 def natural_button(text, chat):
-    """يفهم طلبات الأزرار العربية بدون استهلاك حصة Gemini."""
+    """يفهم طلبات الأزرار العربية بدون استهلاك حصة Groq."""
     t = re.sub(r"\s+", " ", (text or "").strip().lower())
     if not any(k in t for k in ("زر", "الأزرار", "الازرار", "لوحة", "أرسل", "ارسل", "ابغى", "ابي")):
         return False
