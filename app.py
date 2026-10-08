@@ -2315,7 +2315,7 @@ def boot():
     load_state()
     threading.Thread(target=_alpaca_ws_loop, daemon=True).start()
     threading.Thread(target=_alpaca_quote_loop, daemon=True).start()
-    threading.Thread(target=monitor, daemon=True).start()
+    threading.Thread(target=monitor, name=MONITOR_THREAD_NAME, daemon=True).start()
 
 
 boot()
