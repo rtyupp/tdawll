@@ -328,9 +328,12 @@ def alpaca_candles(symbol, days=12):
                          params={"timeframe": "5Min", "start": start.isoformat(), "end": end.isoformat(),
                                  "feed": "iex", "adjustment": "raw", "limit": 10000, "sort": "asc"}, timeout=15)
         if not r.ok:
-            log.warning("alpaca bars HTTP%s: %s", r.status_code, r.text[:160]); return None
+            err = f"Alpaca bars HTTP {r.status_code}: {r.text[:140]}"
+            _data_meta["last_error"] = err; log.warning(err); return None
         bars = r.json().get("bars") or []
-        if not bars: return None
+        if not bars:
+            _data_meta["last_error"] = "Alpaca bars: no IEX bars returned"
+            log.warning(_data_meta["last_error"]); return None
         idx = pd.to_datetime([x["t"] for x in bars], utc=True).tz_convert(NY).tz_localize(None)
         df = pd.DataFrame({"Open": [x["o"] for x in bars], "High": [x["h"] for x in bars],
                            "Low": [x["l"] for x in bars], "Close": [x["c"] for x in bars],
@@ -355,12 +358,23 @@ def _record_live_tick(price, volume=0.0, stamp=None, source="alpaca"):
         _live_ws["last_trade"] = stamp; _live_ws["state"] = f"{source}_connected"; _live_ws["error"] = ""
 
 
+_alpaca_socket = None
+
 def _alpaca_message(_, message):
+    global _alpaca_socket
+    _alpaca_socket = _
     try:
         payload = json.loads(message)
         for obj in payload if isinstance(payload, list) else [payload]:
             typ = obj.get("T")
-            if typ == "t" and obj.get("S") == PRIMARY_LIVE_SYMBOL:
+            if typ == "success" and obj.get("msg") == "authenticated":
+                with _live_lock: _live_ws["state"] = "authenticated"
+                # لا نرسل الاشتراك قبل تأكيد المصادقة.
+                _alpaca_socket.send(json.dumps({"action": "subscribe", "trades": [PRIMARY_LIVE_SYMBOL]}))
+                log.info("Alpaca IEX WebSocket subscribed: %s", PRIMARY_LIVE_SYMBOL)
+            elif typ == "subscription":
+                with _live_lock: _live_ws["state"] = "subscribed"
+            elif typ == "t" and obj.get("S") == PRIMARY_LIVE_SYMBOL:
                 ts = pd.Timestamp(obj["t"]).timestamp()
                 _record_live_tick(float(obj["p"]), float(obj.get("s", 0) or 0), ts, "alpaca_ws")
             elif typ == "error":
@@ -378,10 +392,8 @@ def _alpaca_ws_loop():
         try:
             with _live_lock: _live_ws["state"] = "connecting"
             def opened(sock):
+                with _live_lock: _live_ws["state"] = "authenticating"
                 sock.send(json.dumps({"action": "auth", "key": ALPACA_KEY, "secret": ALPACA_SECRET}))
-                time.sleep(0.3)
-                sock.send(json.dumps({"action": "subscribe", "trades": [PRIMARY_LIVE_SYMBOL]}))
-                log.info("Alpaca IEX WebSocket subscribed: %s", PRIMARY_LIVE_SYMBOL)
             ws = websocket.WebSocketApp("wss://stream.data.alpaca.markets/v2/iex",
                                         on_open=opened, on_message=_alpaca_message,
                                         on_error=_live_ws_error)
