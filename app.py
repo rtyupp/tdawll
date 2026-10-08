@@ -2286,14 +2286,23 @@ def bt_loop():
 
 def monitor():
     time.sleep(8)
-    setup_webhook()
+    log.info("monitor started: poll=%ss focus=%s", SCAN_POLL, state["focus"])
+    try:
+        setup_webhook()
+    except Exception:
+        log.exception("monitor webhook setup")
     if NOTIFY_STARTUP:
-        tg_text(f"✅ Specialist Online | {state['focus']}", TELEGRAM_CHAT_ID, keyboard())
+        try:
+            tg_text(f"✅ Specialist Online | {state['focus']}", TELEGRAM_CHAT_ID, keyboard())
+        except Exception:
+            log.exception("monitor startup notify")
     threading.Thread(target=bt_loop, daemon=True).start()
     last_bar, briefed = None, None
     while True:
         try:
             n = now_et(); sess, _ = session_info(n)
+            if _scan_status.get("at") is None:
+                _scan_set("waiting", f"المراقب يعمل؛ بانتظار شمعة 5 دقائق مغلقة ({sess})")
             if BRIEFING and n.weekday() < 5 and n.hour == 9 and n.minute < 25 and briefed != n.date():
                 briefed = n.date()
                 h_analyze(TELEGRAM_CHAT_ID, "إحاطة ما قبل الافتتاح (6 أسطر): ماذا حدث في الجلسة الماضية، أين يقف السعر من المستويات اليومية، "
@@ -2313,8 +2322,11 @@ def monitor():
                             except Exception as e:
                                 log.exception("live_scan uncaught")
                                 _scan_set("error", f"استثناء غير معالج في الفحص: {str(e)[:180]}")
-        except Exception:
+                    elif _scan_status.get("result") == "waiting":
+                        _scan_set("blocked", "مصدر البيانات متاح لكن لا توجد شمعة 5 دقائق مغلقة بعد")
+        except Exception as e:
             log.exception("monitor")
+            _scan_set("error", f"خطأ في المراقب: {str(e)[:180]}")
         time.sleep(SCAN_POLL)
 
 
