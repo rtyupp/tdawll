@@ -14,6 +14,10 @@ import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify
 from sklearn.ensemble import RandomForestClassifier
+try:
+    import websocket
+except ImportError:
+    websocket = None
 from tda import llm, sources, agents, optflow, optstrat, analytics, xmarket
 import matplotlib
 matplotlib.use("Agg")
@@ -48,12 +52,17 @@ _seen_updates = deque(maxlen=300)
 _cache = {}
 _ml_cache = {}
 _started = time.time()
+_live_lock = threading.Lock()
+_live_bars = {}
+_live_ws = {"state": "disabled", "last_trade": None, "error": ""}
+BAR_MINUTES = 5
+PRIMARY_LIVE_SYMBOL = "SPY"
 
 SYSTEM = """أنت «تداول»، محلل مؤسسي متخصص في مؤشر S&P 500 (SPY / SPX).
 قواعد لا تُكسر:
 1) كل رقم تذكره يجب أن يكون موجوداً في «البطاقة الفنية» المرفقة. ممنوع اختلاق أسعار أو مستويات أو أخبار.
 2) إذا كان السوق مغلقاً فالبطاقة تحوي آخر بيانات حقيقية: حلّل آخر إغلاق وجهّز خطة للافتتاح. لا تقل «لا توجد بيانات» ما دامت البطاقة موجودة.
-3) إذا تعارض الاتجاه على 15 دقيقة مع الاتجاه اليومي فاذكر ذلك صراحة، فهو أهم معلومة في القراءة.
+3) إذا تعارض الاتجاه على 5 دقائق مع الاتجاه اليومي فاذكر ذلك صراحة، فهو أهم معلومة في القراءة.
 4) إن كان نموذج ML موسوماً «غير موثوق» فلا تبنِ عليه؛ اعتمد على درجة القواعد والسياق وقل ذلك بسطر.
 5) في كل قراءة: الاتجاه، الزخم/التشبع، أقرب دعم ومقاومة، وشرط إبطال الفكرة (الوقف).
 6) الأخبار: استخدم العناوين المرفقة فقط، وفرّق بين ما يدعم الاتجاه وما يعاكسه. لا أخبار مرفقة = لا تتحدث عن أخبار.
@@ -62,7 +71,7 @@ SYSTEM = """أنت «تداول»، محلل مؤسسي متخصص في مؤشر
 9) نص عادي. يمكنك **تمييز** كلمات قليلة فقط. بدون عناوين أو جداول.
 10) التزم بالطول المطلوب في الطلب.
 11) عند تقييم «فرصة اقتناص»: الدخول والوقف والأهداف محسوبة بالكود فلا تغيّرها ولا تقترح بدائل. دورك تقييم السياق فقط (اتجاه يومي، VIX، أخبار، عوائق قريبة) وإعطاء حكم صريح، ولا تجامل: إن كان السياق ضد الفرصة فقل ذلك.
-12) OPTIONS_STATE نموذج مبني على مخزون OI المتأخر وبافتراض أن المحترفين طويلو كول وقصيرو بوت. لا تدّعِ معرفة من اشترى أو باع ولا إن كانت الصفقات فتحت أو أغلقت. جدران الغاما وانقلابها سياق وليست دعماً ومقاومة سحرية، وبياناتها متأخرة ~15 دقيقة. ومصدر مفقود يعني غير متاح لا صمت."""
+12) OPTIONS_STATE نموذج مبني على مخزون OI المتأخر وبافتراض أن المحترفين طويلو كول وقصيرو بوت. لا تدّعِ معرفة من اشترى أو باع ولا إن كانت الصفقات فتحت أو أغلقت. جدران الغاما وانقلابها سياق وليست دعماً ومقاومة سحرية، وبياناتها متأخرة ~5 دقائق. ومصدر مفقود يعني غير متاح لا صمت."""
 
 
 # ============================== أدوات عامة ==============================
@@ -282,8 +291,26 @@ def yahoo_candles(symbol, interval, rng):
     return None
 
 
-def finnhub_candles(symbol, res="15", days=12):
-    """احتياطي: شموع Finnhub قد تكون مدفوعة حسب خطتك، لذلك ليست المصدر الأول."""
+def _overlay_live_bar(df, symbol):
+    """يضيف آخر شمعة مجمّعة من WebSocket فوق تاريخ Finnhub إن توفرت."""
+    if df is None or symbol != PRIMARY_LIVE_SYMBOL:
+        return df
+    with _live_lock:
+        b = dict(_live_bars.get(symbol) or {})
+    if not b or not b.get("ts"):
+        return df
+    ix = pd.Timestamp(b["ts"])
+    row = {k: float(b[k]) for k in ("Open", "High", "Low", "Close", "Volume")}
+    out = df.copy()
+    if ix in out.index:
+        for k, v in row.items(): out.loc[ix, k] = v
+    else:
+        out.loc[ix, list(row)] = list(row.values())
+    return out.sort_index()
+
+
+def finnhub_candles(symbol, res="5", days=12):
+    """المصدر الرئيسي للشموع: Finnhub؛ جودة اللحظة تعتمد على صلاحية FINNHUB_KEY."""
     if not FINNHUB_KEY:
         return None
     try:
@@ -294,19 +321,68 @@ def finnhub_candles(symbol, res="15", days=12):
         if j.get("s") != "ok" or not j.get("c"):
             return None
         idx = pd.to_datetime(j["t"], unit="s", utc=True).tz_convert(NY).tz_localize(None)
-        return pd.DataFrame({"Open": j["o"], "High": j["h"], "Low": j["l"], "Close": j["c"], "Volume": j["v"]}, index=idx)
+        return _overlay_live_bar(pd.DataFrame({"Open": j["o"], "High": j["h"], "Low": j["l"], "Close": j["c"], "Volume": j["v"]}, index=idx), symbol)
     except Exception as e:
         log.warning("finnhub candle err: %s", e)
         return None
 
 
-def candles(symbol, interval="15m", rng="60d"):
+def _live_trade_message(_, message):
+    try:
+        obj = json.loads(message)
+        if obj.get("type") != "trade": return
+        with _live_lock:
+            for tick in obj.get("data", []):
+                if tick.get("s") != PRIMARY_LIVE_SYMBOL: continue
+                price, volume, stamp = float(tick["p"]), float(tick.get("v", 0) or 0), float(tick["t"]) / 1000
+                dt = datetime.fromtimestamp(stamp, NY).replace(tzinfo=None)
+                minute = (dt.minute // BAR_MINUTES) * BAR_MINUTES
+                ix = dt.replace(minute=minute, second=0, microsecond=0)
+                b = _live_bars.get(PRIMARY_LIVE_SYMBOL)
+                if not b or b["ts"] != ix:
+                    b = {"ts": ix, "Open": price, "High": price, "Low": price, "Close": price, "Volume": 0.0}
+                    _live_bars[PRIMARY_LIVE_SYMBOL] = b
+                b["High"] = max(b["High"], price); b["Low"] = min(b["Low"], price)
+                b["Close"] = price; b["Volume"] += volume
+                _live_ws["last_trade"] = stamp; _live_ws["state"] = "connected"
+    except Exception as e:
+        log.debug("finnhub websocket message: %s", e)
+
+
+def _live_ws_error(_, error):
+    with _live_lock:
+        _live_ws.update(state="error", error=str(error)[:180])
+    log.warning("finnhub websocket: %s", error)
+
+
+def _live_ws_loop():
+    if not FINNHUB_KEY or websocket is None:
+        with _live_lock: _live_ws["state"] = "unavailable"
+        log.warning("live source unavailable: FINNHUB_KEY or websocket-client missing")
+        return
+    while True:
+        try:
+            with _live_lock: _live_ws["state"] = "connecting"
+            ws = websocket.WebSocketApp(
+                "wss://ws.finnhub.io?token=" + FINNHUB_KEY,
+                on_open=lambda sock: (sock.send(json.dumps({"type": "subscribe", "symbol": PRIMARY_LIVE_SYMBOL})),
+                                      log.info("Finnhub live WebSocket subscribed: %s", PRIMARY_LIVE_SYMBOL)),
+                on_message=_live_trade_message, on_error=_live_ws_error)
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            _live_ws_error(None, e)
+        time.sleep(5)
+
+
+def candles(symbol, interval="5m", rng="60d"):
     def go():
+        # Finnhub + WebSocket هو الأساسي لفريم 5 دقائق؛ Yahoo آخر احتياط.
+        if symbol == PRIMARY_LIVE_SYMBOL and interval == "5m":
+            df = finnhub_candles(symbol, res="5", days=12)
+            if df is not None: return df
         df = yahoo_candles(symbol, interval, rng)
-        if df is None and symbol == "SPY" and interval == "15m":
-            df = finnhub_candles(symbol)
         return df
-    return cached(f"c:{symbol}:{interval}:{rng}", 60 if interval != "1d" else 600, go)
+    return cached(f"c:{symbol}:{interval}:{rng}", 20 if interval != "1d" else 600, go)
 
 
 NEWS_KW = re.compile(r"\b(fed|powell|fomc|inflation|cpi|ppi|pce|jobs|payroll|unemployment|rates?|yields?|treasur\w*|tariffs?|"
@@ -477,9 +553,9 @@ def confluence(l, D, macro, ml):
     s, why = 0, []
     e9, e21, e50 = l["EMA9"], l["EMA21"], l["EMA50"]
     if ok(e50) and e9 > e21 > e50:
-        s += 25; why.append("اتجاه 15د صاعد منظم (EMA9>21>50)")
+        s += 25; why.append("اتجاه 5د صاعد منظم (EMA9>21>50)")
     elif ok(e50) and e9 < e21 < e50:
-        s -= 25; why.append("اتجاه 15د هابط منظم (EMA9<21<50)")
+        s -= 25; why.append("اتجاه 5د هابط منظم (EMA9<21<50)")
     elif e9 > e21:
         s += 10; why.append("EMA9 فوق EMA21")
     else:
@@ -540,11 +616,11 @@ def dtrend_map(sym):
 
 def snapshot(closed_only=False, label=None):
     label = label or state["focus"]; sym = SYMBOLS[label]
-    raw = candles(sym, "15m", "60d")
+    raw = candles(sym, "5m", "12d")
     if raw is None or len(raw) < 120:
         return None
     if closed_only:                                  # نتجاهل الشمعة التي لم تُغلق بعد
-        raw = raw[raw.index + pd.Timedelta(minutes=15) <= now_et().replace(tzinfo=None)]
+        raw = raw[raw.index + pd.Timedelta(minutes=BAR_MINUTES) <= now_et().replace(tzinfo=None)]
         if len(raw) < 120:
             return None
     d = add_indicators(raw).dropna(subset=["RSI", "MACD_H", "EMA21", "BBU", "STOCH", "ATR"])
@@ -563,7 +639,7 @@ def snapshot(closed_only=False, label=None):
     S = dict(label=label, sym=sym, d=d, l=l, D=D, macro=macro, ml=ml, score=score, why=why, dir=direction,
              dmap=dmap, dtrend=dmap.get(d.index[-1].date(), 0),
              price=price, chg=(price / ref - 1) * 100, atr=float(l["ATR"]), sess=sess, sess_txt=sess_txt,
-             stale=(sess == "open" and age > 45), last_bar=d.index[-1])
+             stale=(sess == "open" and age > 12), last_bar=d.index[-1])
     if direction:
         risk = 1.2 * S["atr"]
         S["plan"] = dict(entry=price, stop=price - direction * risk, t1=price + direction * risk,
@@ -583,7 +659,7 @@ def ml_line(S):
 
 def level_list(S):
     l, D = S["l"], S["D"]
-    lv = [("VWAP", l["VWAP"]), ("EMA21 (15د)", l["EMA21"]), ("EMA50 (15د)", l["EMA50"]),
+    lv = [("VWAP", l["VWAP"]), ("EMA21 (5د)", l["EMA21"]), ("EMA50 (5د)", l["EMA50"]),
           ("بولنجر العلوي", l["BBU"]), ("بولنجر السفلي", l["BBL"])]
     if D:
         lv += [("أعلى أمس", D["prev_high"]), ("أدنى أمس", D["prev_low"]), ("إغلاق أمس", D["prev_close"]),
@@ -707,7 +783,7 @@ def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
     return "❌ تعذّر توليد الإجابة (حد الاستخدام أو خلل مؤقت). جرّب بعد قليل."
 
 
-# ============================== محرك اقتناص الفرص (فريم 15 دقيقة) ==============================
+# ============================== محرك اقتناص الفرص (فريم 5 دقائق) ==============================
 GRADE_MIN = {"A": 75, "B": 62, "C": 48}
 GRADE_RANK = {"A": 3, "B": 2, "C": 1}
 SETUP_AR = {"ORB": "اختراق نطاق الافتتاح", "VWAP": "استعادة/رفض VWAP", "PULLBACK": "ارتداد من EMA21 مع الاتجاه",
@@ -918,8 +994,8 @@ def finalize(P, i, ctx, cand):
         s -= 5 if rev else 12; notes.append("⚠️ يعاكس الاتجاه اليومي")
     e9, e21, e50 = P["EMA9"][i], P["EMA21"][i], P["EMA50"][i]
     if ok(e50):
-        if (dr == 1 and e9 > e21 > e50) or (dr == -1 and e9 < e21 < e50): s += 8; notes.append("ترتيب EMA على 15د معه")
-        elif not rev and ((dr == 1 and e9 < e21 < e50) or (dr == -1 and e9 > e21 > e50)): s -= 6; notes.append("⚠️ ترتيب EMA على 15د ضده")
+        if (dr == 1 and e9 > e21 > e50) or (dr == -1 and e9 < e21 < e50): s += 8; notes.append("ترتيب EMA على 5د معه")
+        elif not rev and ((dr == 1 and e9 < e21 < e50) or (dr == -1 and e9 > e21 > e50)): s -= 6; notes.append("⚠️ ترتيب EMA على 5د ضده")
     if name != "VWAP": s += 5 if (c > P["VWAP"][i]) == (dr == 1) else -3
     v = P["VOLR"][i]
     if v >= 1.5: s += 8; notes.append(f"حجم قوي {v:.1f}x")
@@ -1012,7 +1088,7 @@ def run_backtest(d, ctx):
 
 def refresh_backtest():
     sym = SYMBOLS[state["focus"]]
-    raw = candles(sym, "15m", "60d")
+    raw = candles(sym, "5m", "12d")
     if raw is None or len(raw) < 300: return False
     d = add_indicators(raw).dropna(subset=["RSI", "MACD_H", "EMA21", "BBU", "STOCH", "ATR"])
     ctx = {"dmap": dtrend_map(sym), "dtrend": 0, "vix": None, "ml": None, "use_bt": False}
@@ -1068,7 +1144,7 @@ def watchlist(S, P):
 def signal_text(sg, S, ai=None, others=None):
     side = "شراء 🟢" if sg["dir"] > 0 else "بيع 🔴"
     ts = pd.Timestamp(sg["ts"])
-    out = [f"🎯 <b>فرصة {sg['grade']}</b> · {S['label']} · فريم 15د · جودة {sg['score']}/100",
+    out = [f"🎯 <b>فرصة {sg['grade']}</b> · {S['label']} · فريم 5د · جودة {sg['score']}/100",
            f"<b>{SETUP_AR[sg['name']]}</b> — {side}",
            f"دخول ≈ <b>{sg['entry']:.2f}</b> (إغلاق شمعة {ts:%H:%M} ET)",
            f"وقف <b>{sg['stop']:.2f}</b> (مخاطرة {sg['risk']:.2f}$)",
@@ -1083,7 +1159,7 @@ def signal_text(sg, S, ai=None, others=None):
 
 def sig_task(sg, others):
     conflict = [o for o in (others or []) if o["dir"] != sg["dir"]]
-    return ("فرصة اقتناص رُصدت بالكود على فريم 15 دقيقة. الأرقام التالية محسوبة وثابتة ولا تغيّرها:\n"
+    return ("فرصة اقتناص رُصدت بالكود على فريم 5 دقائق. الأرقام التالية محسوبة وثابتة ولا تغيّرها:\n"
             f"السيناريو: {SETUP_AR[sg['name']]} | الاتجاه: {'شراء' if sg['dir'] > 0 else 'بيع'} | الجودة {sg['score']}/100 ({sg['grade']})\n"
             f"دخول {sg['entry']:.2f} | وقف {sg['stop']:.2f} | هدف1 {sg['t1']:.2f} ({sg['t1n']}) | هدف2 {sg['t2']:.2f}\n"
             f"أسباب الكود: {'؛ '.join(sg['notes'])}\n"
@@ -1335,7 +1411,7 @@ def chart_img(S, bars=70, plan=None):
     lo, hi = d["Low"].min(), d["High"].max(); pad = (hi - lo) * .08
     ab, bl = level_list(S)
     for nm, v in ab + bl:
-        if lo - pad <= v <= hi + pad and nm not in ("VWAP", "EMA21 (15د)", "EMA50 (15د)", "بولنجر العلوي", "بولنجر السفلي"):
+        if lo - pad <= v <= hi + pad and nm not in ("VWAP", "EMA21 (5د)", "EMA50 (5د)", "بولنجر العلوي", "بولنجر السفلي"):
             ax.axhline(v, color="#8888ff", lw=.7, ls="--", alpha=.7)
             ax.text(n - 0.5, v, f" {v:.2f}", color="#aaaaff", fontsize=7, va="center")
     if plan:
@@ -1360,7 +1436,7 @@ def chart_img(S, bars=70, plan=None):
                 ax.scatter([jx], [lvl], marker="*", s=260, color="#ffd54f", edgecolor="white", zorder=6)
     ax.set_ylim(lo - pad, hi + pad)
     ax.legend(loc="upper left", fontsize=7, facecolor=pan, edgecolor="#333", labelcolor="#ddd")
-    ax.set_title(f"{S['label']}  15m  {S['price']:.2f}" + (f"   |   {plan['title']}" if plan and plan.get("title") else ""), color="white", fontsize=11)
+    ax.set_title(f"{S['label']}  5m  {S['price']:.2f}" + (f"   |   {plan['title']}" if plan and plan.get("title") else ""), color="white", fontsize=11)
     axv.bar(x, d["Volume"].values, color=col, width=.65); axv.set_ylabel("Vol", color="#ccc", fontsize=8)
     axr.plot(x, d["RSI"], color="#00ff88", lw=1.3)
     axr.axhline(70, color="#ff3366", ls="--", lw=.6); axr.axhline(30, color="#00ff88", ls="--", lw=.6)
@@ -1416,13 +1492,13 @@ def h_start(chat, arg=""):
     if a == "cmds": return h_commands(chat)
     if a == "panel": return h_panel(chat)
     if not is_owner():
-        return tg_text("👋 <b>أهلاً بك</b>\nهذا البوت يرسل توصيات مؤشر S&P 500 على فريم 15 دقيقة في القناة، "
+        return tg_text("👋 <b>أهلاً بك</b>\nهذا البوت يرسل توصيات مؤشر S&P 500 على فريم 5 دقائق في القناة، "
                        "ويتابع تحقق الأهداف.\nيمكنك هنا معرفة السعر والمستويات وأداء التوصيات.\n\n"
                        "<i>تحليل فني آلي وليس توصية استثمارية.</i>", chat, keyboard())
     ch = (f"القناة: <b>{html.escape(CHANNEL_ID)}</b> ({'مفعّلة ✅' if in_channel() else 'متوقفة ⛔'})" if CHANNEL_ID
           else "القناة: غير مضبوطة (أضف CHANNEL_ID) — التوصيات تصلك هنا")
     tg_text("<b>👋 S&P 500 Specialist v3.4 — صائد الفرص</b>\n\n"
-            f"التركيز: <b>{state['focus']}</b> · فريم 15 دقيقة · حد التنبيه: <b>{settings['min_grade']}</b> · بوابة اللجنة: <b>{settings.get('gate', 'soft')}</b>\n"
+            f"التركيز: <b>{state['focus']}</b> · فريم 5 دقائق · حد التنبيه: <b>{settings['min_grade']}</b> · بوابة اللجنة: <b>{settings.get('gate', 'soft')}</b>\n"
             f"{ch}\n\nأراقب كل شمعة عند إغلاقها وأنشر التوصية بصورة الشارت في القناة، ثم أعلن تحقق الهدف الأول والثاني.\n\n"
             "اضغط <b>📋 جميع الأوامر</b> لقائمة الأوامر، أو <b>🎛️ الأزرار</b> لباقي الأزرار.\n"
             "<i>تحليل فني آلي وليس توصية استثمارية. الأداء السابق لا يضمن المستقبل.</i>", chat, keyboard())
@@ -1477,7 +1553,7 @@ def h_price(chat):
     if not S: return no_data(chat)
     l = S["l"]
     tg_text(f"💰 {head(S)}\n"
-            f"📈 15د: {'صاعد' if l['EMA9'] > l['EMA21'] else 'هابط'} | RSI {l['RSI']:.0f} | "
+            f"📈 5د: {'صاعد' if l['EMA9'] > l['EMA21'] else 'هابط'} | RSI {l['RSI']:.0f} | "
             f"{'فوق' if l['Close'] > l['VWAP'] else 'تحت'} VWAP {l['VWAP']:.2f}\n"
             f"📐 {DIR_TXT[S['dir']]} ({S['score']:+d})", chat, keyboard())
 
@@ -1488,7 +1564,7 @@ def h_levels(chat):
     ab, bl = level_list(S)
     fmt = lambda lst: "\n".join(f"  • {n} — <b>{v:.2f}</b> ({(v / S['price'] - 1) * 100:+.2f}%)" for n, v in lst) or "  —"
     tg_text(f"🎯 {head(S)}\n\n<b>فوق السعر</b> (الأقرب أولاً)\n{fmt(ab)}\n\n<b>تحت السعر</b>\n{fmt(bl)}\n\n"
-            f"ATR(15د) = {S['atr']:.2f} → وقف 1.2×ATR ≈ {1.2 * S['atr']:.2f}$", chat, keyboard())
+            f"ATR(5د) = {S['atr']:.2f} → وقف 1.2×ATR ≈ {1.2 * S['atr']:.2f}$", chat, keyboard())
 
 
 def h_analyze(chat, task=None, title="🧠"):
@@ -1592,7 +1668,7 @@ def h_stats(chat):
         L.append("\nلا توجد إشارات حية مكتملة بعد.")
     L.append(f"\n🧠 دروس محفوظة: {len(lessons)} · استدعاءات Gemini منذ التشغيل: {llm.stats['calls']} (فشل {llm.stats['fail']})")
     if BT.get("stats"):
-        L.append(f"\n<b>باكتست {BT['days']} يوم ({BT['symbol']}) — شموع 15د</b>")
+        L.append(f"\n<b>باكتست {BT['days']} يوم ({BT['symbol']}) — شموع 5د</b>")
         for k, v in sorted(BT["stats"].items(), key=lambda kv: -kv[1]["avgR"]):
             pf = "∞" if v["pf"] == float("inf") else f"{v['pf']:.2f}"
             ev = analytics.evidence(v, BT.get("placebo", {}).get(k), len([x for x in live_sigs if x["name"] == k and x["status"] != "open"]),
@@ -1619,7 +1695,7 @@ def h_alert(chat, arg=""):
     if not m:
         return tg_text("اكتب مثلاً: <code>/alert 620.5</code> وسأنبهك عند وصول السعر إليه.", chat, keyboard())
     lvl = float(m.group().replace(",", "."))
-    raw = candles(SYMBOLS[state["focus"]], "15m", "60d")
+    raw = candles(SYMBOLS[state["focus"]], "5m", "12d")
     if raw is None: return no_data(chat)
     price = float(raw["Close"].iloc[-1])
     with _lock: price_alerts.append({"level": lvl, "dir": "up" if lvl > price else "down", "chat": str(chat)})
@@ -1749,7 +1825,7 @@ def h_flow(chat):
     if OF["pc_vol"] is not None: L.append(f"نسبة بوت/كول: حجم {OF['pc_vol']:.2f}" + (f" · OI {OF['pc_oi']:.2f}" if OF["pc_oi"] is not None else ""))
     p = OF["prem"]
     if p["call"] + p["put"] > 0: L.append(f"أقساط اليوم: كول ${p['call'] / 1e6:.1f}M / بوت ${p['put'] / 1e6:.1f}M <i>(لا نعرف من البادئ)</i>")
-    ai = brain("اشرح في 4 أسطر ماذا تعني حالة الأوبشن هذه لتداول 15 دقيقة اليوم: أين الجدران والانقلاب بالنسبة للسعر، "
+    ai = brain("اشرح في 4 أسطر ماذا تعني حالة الأوبشن هذه لتداول 5 دقائق اليوم: أين الجدران والانقلاب بالنسبة للسعر، "
                "هل نتوقع تخميداً أم تسارعاً، وما الذي يبطل القراءة. لا تدّعِ معرفة من اشترى ومن باع.", card_text(S, False, ext=False) + "\n" + "\n".join(optflow.card_lines(OF)),
                chat, tokens=330, memo="طلب حالة الأوبشن")
     L.append("\n🧠 " + fmt_ai(ai))
@@ -1966,7 +2042,13 @@ def webhook():
 @app.route("/health")
 def health():
     s, t = session_info()
-    return jsonify({"status": "ok", "bot": "tdawll-v3.4", "focus": state["focus"], "session": s,
+    with _live_lock:
+        live = dict(_live_ws)
+    live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
+                                   if live.get("last_trade") else None)
+    return jsonify({"status": "ok", "bot": "tdawll-v3.4", "focus": state["focus"], "timeframe": "5m",
+                    "data_primary": "finnhub_websocket", "data_fallback": "yahoo_chart",
+                    "live": live, "session": s,
                     "uptime_min": int((time.time() - _started) / 60), "time_et": now_et().strftime("%H:%M:%S")})
 
 
@@ -2009,9 +2091,9 @@ def monitor():
                 h_analyze(TELEGRAM_CHAT_ID, "إحاطة ما قبل الافتتاح (6 أسطر): ماذا حدث في الجلسة الماضية، أين يقف السعر من المستويات اليومية، "
                           "أهم خبر/VIX، خطة السيناريوهين (صعود/هبوط) مع شرط الإبطال.", "🌅")
             if sess == "open" or (sess == "after" and n.hour == 16 and n.minute < 20):
-                raw = candles(SYMBOLS[state["focus"]], "15m", "60d")
+                raw = candles(SYMBOLS[state["focus"]], "5m", "12d")
                 if raw is not None and len(raw):
-                    closed = raw[raw.index + pd.Timedelta(minutes=15) <= n.replace(tzinfo=None)]
+                    closed = raw[raw.index + pd.Timedelta(minutes=BAR_MINUTES) <= n.replace(tzinfo=None)]
                     check_price_alerts(raw)
                     if len(closed):
                         track_outcomes(closed, raw)
@@ -2030,6 +2112,7 @@ def boot():
     if _booted: return
     _booted = True
     load_state()
+    threading.Thread(target=_live_ws_loop, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
 
 

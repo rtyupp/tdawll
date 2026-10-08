@@ -32,7 +32,7 @@ def rating_dir(r):
     return {"Buy": 1, "Overweight": 1, "Sell": -1, "Underweight": -1, "Hold": 0}.get(r)
 
 
-GUIDE = ("You work inside a Telegram trading assistant for the S&P 500 ({label}), 15-minute timeframe.\n"
+GUIDE = ("You work inside a Telegram trading assistant for the S&P 500 ({label}), 5-minute timeframe.\n"
          "Hard rules:\n"
          "1. Use ONLY the evidence in the CARD. Every price or number you cite must appear in it. Never invent news, levels or data.\n"
          "2. A source marked unavailable is NOT silence: say it is missing and lower confidence accordingly.\n"
@@ -40,7 +40,7 @@ GUIDE = ("You work inside a Telegram trading assistant for the S&P 500 ({label})
          "4. Weigh arguments on merit, independent of speaking order. Conflict alone is not a reason to Hold: commit to the "
          "stronger side, sized by how decisively it wins. Choose Hold only if the evidence is balanced or too thin.\n"
          "5. A setup's historical stats describe a small sample, not a guarantee. Lessons are single-trade reviews, not proven rules.\n"
-         "6. Ratings are about the direction of {label} over roughly the next 2 hours (8 bars): Buy/Overweight = long bias, "
+         "6. Ratings are about the direction of {label} over roughly the next 2 hours (24 bars): Buy/Overweight = long bias, "
          "Sell/Underweight = short bias, Hold = no edge.")
 
 

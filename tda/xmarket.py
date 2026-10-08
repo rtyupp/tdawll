@@ -2,7 +2,7 @@
 """
 سياق الأسواق المتقاطعة (Layer 1 في بحث options-flow: «لا نعامل كل أصل مرتبط كمتنبئ مستقل؛ المعلومة في التباعد»).
 
-نقيس خلال آخر ساعتين (8 شموع 15د): هل QQQ وIWM وXLK وSMH تؤكد حركة SPY؟ هل الائتمان (HYG) يوافق؟ وما شكل منحنى VIX
+نقيس خلال آخر ساعتين (24 شمعة 5د): هل QQQ وIWM وXLK وSMH تؤكد حركة SPY؟ هل الائتمان (HYG) يوافق؟ وما شكل منحنى VIX
 (VIX9D / VIX / VIX3M)؟ لا بيانات تاريخية متوازية هنا، لذلك التعديلات صغيرة ومُسجَّلة لتُقاس حيّاً في /stats.
 """
 import logging
@@ -35,7 +35,7 @@ def compute(fetch, spy_df):
         return None
     idx = spy_df.index[-60:]
     spy_ret = _ret(spy_df, idx)
-    jobs = {s: _pool.submit(fetch, s, "15m", "5d") for s in (*EQUITY, CREDIT)}
+    jobs = {s: _pool.submit(fetch, s, "5m", "5d") for s in (*EQUITY, CREDIT)}
     vjobs = {k: _pool.submit(fetch, s, "1d", "1mo") for k, s in VIX_SYMS.items()}
     wait(list(jobs.values()) + list(vjobs.values()), timeout=20)
     peers = {}
