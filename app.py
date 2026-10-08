@@ -378,7 +378,9 @@ def _alpaca_message(_, message):
                 ts = pd.Timestamp(obj["t"]).timestamp()
                 _record_live_tick(float(obj["p"]), float(obj.get("s", 0) or 0), ts, "alpaca_ws")
             elif typ == "error":
-                with _live_lock: _live_ws.update(state="error", error=str(obj.get("msg", "Alpaca error"))[:180])
+                msg = str(obj.get("msg", "Alpaca error"))[:180]
+                with _live_lock: _live_ws.update(state="error", error=msg)
+                log.error("alpaca stream error: %s", msg)
     except Exception as e:
         log.debug("alpaca websocket message: %s", e)
 
@@ -394,10 +396,13 @@ def _alpaca_ws_loop():
             def opened(sock):
                 with _live_lock: _live_ws["state"] = "authenticating"
                 sock.send(json.dumps({"action": "auth", "key": ALPACA_KEY, "secret": ALPACA_SECRET}))
+            def closed(sock, code, reason):
+                with _live_lock: _live_ws.update(state="disconnected", error=f"close {code}: {reason or ''}"[:180])
+                log.warning("alpaca websocket closed: %s %s", code, reason)
             ws = websocket.WebSocketApp("wss://stream.data.alpaca.markets/v2/iex",
                                         on_open=opened, on_message=_alpaca_message,
-                                        on_error=_live_ws_error)
-            ws.run_forever(ping_interval=20, ping_timeout=10)
+                                        on_error=_live_ws_error, on_close=closed)
+            ws.run_forever(ping_interval=15, ping_timeout=8, dispatcher=None)
         except Exception as e:
             _live_ws_error(None, e)
         time.sleep(5)
@@ -408,13 +413,21 @@ def _alpaca_quote_loop():
     if not ALPACA_KEY or not ALPACA_SECRET: return
     while True:
         try:
+            params = {"feed": "iex"}
             r = requests.get(f"{ALPACA_DATA_URL}/v2/stocks/{PRIMARY_LIVE_SYMBOL}/trades/latest",
-                             headers=_alpaca_headers(), params={"feed": "iex"}, timeout=10)
+                             headers=_alpaca_headers(), params=params, timeout=10)
             j = r.json() if r.ok else {}; tr = j.get("trade") or {}
+            if not tr.get("p"):
+                # snapshot كمسار ثانٍ إذا كان endpoint آخر صفقة فارغًا.
+                sr = requests.get(f"{ALPACA_DATA_URL}/v2/stocks/{PRIMARY_LIVE_SYMBOL}/snapshot",
+                                  headers=_alpaca_headers(), params=params, timeout=10)
+                sj = sr.json() if sr.ok else {}
+                tr = sj.get("latestTrade") or {}
             if tr.get("p") and tr.get("t"):
                 _record_live_tick(float(tr["p"]), float(tr.get("s", 0) or 0), pd.Timestamp(tr["t"]).timestamp(), "alpaca_rest")
-            elif not r.ok:
-                with _live_lock: _live_ws["error"] = f"Alpaca REST HTTP {r.status_code}"
+            else:
+                detail = r.text[:120] if not r.ok else "no latestTrade in trade/snapshot response"
+                with _live_lock: _live_ws.update(state="rest_waiting", error=f"Alpaca REST: {detail}")
         except Exception as e:
             with _live_lock: _live_ws["error"] = str(e)[:180]
         time.sleep(15)
