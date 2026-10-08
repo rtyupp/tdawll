@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 tdawll v2 — بوت تحليل S&P 500 (SPY / SPX) على تيليجرام
-البيانات: Yahoo (بدون مفتاح) + Finnhub احتياطي | الذكاء: Gemini | الاستضافة: Render المجاني
+البيانات: Alpaca IEX فقط | الذكاء: Groq ثم Gemini | الاستضافة: Render المجاني
 """
 import os, io, re, json, time, html, logging, threading
 from collections import deque
@@ -271,33 +271,6 @@ def dest_kb(dest):
 
 
 # ============================== البيانات ==============================
-def yahoo_candles(symbol, interval, rng):
-    for host in ("query1", "query2"):
-        try:
-            r = requests.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}",
-                             params={"interval": interval, "range": rng, "includePrePost": "false"},
-                             headers=UA, timeout=15)
-            if r.status_code != 200:
-                log.warning("yahoo %s %s -> %s", host, symbol, r.status_code)
-                continue
-            res = r.json()["chart"]["result"][0]
-            ts = res.get("timestamp")
-            q = res["indicators"]["quote"][0]
-            if not ts:
-                continue
-            idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(NY).tz_localize(None)
-            df = pd.DataFrame({"Open": q["open"], "High": q["high"], "Low": q["low"],
-                               "Close": q["close"], "Volume": q["volume"]}, index=idx)
-            df = df.dropna(subset=["Open", "High", "Low", "Close"])
-            df["Volume"] = df["Volume"].fillna(0)
-            df = df[~df.index.duplicated(keep="last")]
-            if len(df):
-                return df
-        except Exception as e:
-            log.warning("yahoo err %s: %s", symbol, e)
-    return None
-
-
 def _overlay_live_bar(df, symbol):
     """يضيف آخر شمعة مجمّعة من WebSocket فوق تاريخ Finnhub إن توفرت."""
     if df is None or symbol != PRIMARY_LIVE_SYMBOL:
@@ -456,15 +429,14 @@ def _live_ws_error(_, error):
 
 
 def candles(symbol, interval="5m", rng="60d"):
+    """Alpaca IEX فقط؛ لا يوجد fallback لبيانات متأخرة أو غير متسقة."""
     def go():
-        if symbol == PRIMARY_LIVE_SYMBOL and interval == "5m":
-            df = alpaca_candles(symbol, days=12)
-            if df is not None:
-                _data_meta.update(source="alpaca_iex", last_ok=time.time(), last_error="", bars=len(df)); return df
-        df = yahoo_candles(symbol, interval, rng)
+        days = 12 if interval == "5m" else 365
+        df = alpaca_candles(symbol, days=days)
         if df is not None:
-            _data_meta.update(source="yahoo_fallback", last_ok=time.time(), last_error="", bars=len(df))
-        else: _data_meta.update(last_error=f"لا بيانات لـ {symbol} {interval}")
+            _data_meta.update(source="alpaca_iex", last_ok=time.time(), last_error="", bars=len(df))
+        else:
+            _data_meta.update(source="alpaca_unavailable", last_error=f"لا بيانات Alpaca لـ {symbol} {interval}", bars=0)
         return df
     return cached(f"c:{symbol}:{interval}:{rng}", 20 if interval != "1d" else 600, go)
 
@@ -485,17 +457,6 @@ def get_news(n=8):
                         items.append({"h": x["headline"], "u": x.get("url", ""), "s": x.get("source", ""), "t": x["datetime"]})
             except Exception as e:
                 log.warning("finnhub news: %s", e)
-        if len(items) < 3:
-            try:
-                j = requests.get("https://query1.finance.yahoo.com/v1/finance/search",
-                                 params={"q": "S&P 500 stock market", "newsCount": 12, "quotesCount": 0},
-                                 headers=UA, timeout=10).json()
-                for x in j.get("news", []):
-                    if x.get("title"):
-                        items.append({"h": x["title"], "u": x.get("link", ""), "s": x.get("publisher", ""),
-                                      "t": x.get("providerPublishTime", 0)})
-            except Exception as e:
-                log.warning("yahoo news: %s", e)
         seen, out = set(), []
         for x in sorted(items, key=lambda z: -z["t"]):
             k = x["h"].lower()[:60]
@@ -1610,7 +1571,7 @@ def head(S):
 
 
 def no_data(chat):
-    tg_text("⚠️ تعذّر جلب بيانات السوق الآن (Yahoo/Finnhub). أعد المحاولة بعد دقيقة.", chat, keyboard())
+    tg_text("⚠️ تعذّر جلب بيانات Alpaca IEX الآن؛ تم إيقاف التحليل حتى تصل شموع موثوقة.", chat, keyboard())
 
 
 def commands_text(owner=True):
@@ -1642,7 +1603,7 @@ def h_data_status(chat, arg=""):
            f"الحالة: <b>{live.get('state')}</b>\n"
            f"آخر Tick: {f'قبل {age:.1f} ثانية' if age is not None else 'لا يوجد بعد'}\n"
            f"مصدر الشموع: <b>{_data_meta.get('source')}</b> · عددها {_data_meta.get('bars', 0)}\n"
-           f"الاحتياطي: Yahoo Chart\nالفريم: <b>5 دقائق</b>")
+           f"لا يوجد احتياطي؛ يتوقف البوت عند غياب Alpaca\nالفريم: <b>5 دقائق</b>")
     tg_text(msg, chat, keyboard())
 
 
@@ -2251,7 +2212,7 @@ def health():
                     "monitor": {"heartbeat": _monitor_heartbeat,
                                 "age_sec": round(time.time() - _monitor_heartbeat, 1) if _monitor_heartbeat else None},
                     "data_primary": "alpaca_rest_snapshot" if not ALPACA_WS_ENABLED else "alpaca_iex_websocket",
-                    "data_fallback": "yahoo_chart", "alpaca_ws_enabled": ALPACA_WS_ENABLED,
+                    "data_fallback": None, "alpaca_ws_enabled": ALPACA_WS_ENABLED,
                     "alpaca_configured": bool(ALPACA_KEY and ALPACA_SECRET),
                     "llm": llm.provider_status(),
                     "live": live, "data": dict(_data_meta), "last_scan": dict(_scan_status), "session": s,
