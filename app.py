@@ -244,12 +244,7 @@ def is_owner():
 
 
 def keyboard():
-    """مضغوط: زران فقط. كل الأزرار الأخرى مجمّعة تحت زر «الأزرار»."""
-    return {"inline_keyboard": [[{"text": "📋 جميع الأوامر", "callback_data": "menu_cmds"},
-                                 {"text": "🎛️ الأزرار", "callback_data": "menu_panel"}]]}
-
-
-def panel_keyboard():
+    """الكيبورد الرئيسي: أزرار الأوامر مباشرة. زر «إخفاء» يطويه."""
     if is_owner():
         rows = [
             [{"text": "🎯 اقتناص الفرص", "callback_data": "scan"}, {"text": "🧠 تحليل ذكي", "callback_data": "analyze"}],
@@ -259,12 +254,23 @@ def panel_keyboard():
             [{"text": "📉 حالة الأوبشن", "callback_data": "flow"}, {"text": "🧩 هياكل أوبشن", "callback_data": "options"}],
             [{"text": "📊 الإحصائيات", "callback_data": "stats"}, {"text": "🔬 الأفضلية", "callback_data": "edge"}],
             [{"text": "🔄 SPY ⇄ SPX", "callback_data": "switch"}, {"text": "📣 تحكم القناة", "callback_data": "ch_menu"}],
+            [{"text": "📋 قائمة الأوامر", "callback_data": "menu_cmds"}],
         ]
     else:
         rows = [[{"text": "💰 السعر", "callback_data": "price"}, {"text": "🎯 المستويات", "callback_data": "levels"}],
                 [{"text": "📊 الإحصائيات", "callback_data": "stats"}]]
-    rows.append([{"text": "⬅️ إخفاء الأزرار", "callback_data": "menu_hide"}])
+    rows.append([{"text": "🧹 إخفاء الأزرار", "callback_data": "menu_hide"}])
     return {"inline_keyboard": rows}
+
+
+def hidden_keyboard():
+    """يطوي أزرار الأوامر ويترك زر استعادة واحد."""
+    return {"inline_keyboard": [[{"text": "🎛️ إظهار الأزرار", "callback_data": "menu_show"}]]}
+
+
+def panel_keyboard():
+    """متوافق للخلف: نفس شبكة أزرار الأوامر."""
+    return keyboard()
 
 
 def channel_keyboard():
@@ -1661,7 +1667,7 @@ def h_start(chat, arg=""):
     tg_text("<b>👋 S&P 500 Specialist v3.4 — صائد الفرص</b>\n\n"
             f"التركيز: <b>{state['focus']}</b> · فريم 5 دقائق · حد التنبيه: <b>{settings['min_grade']}</b> · بوابة اللجنة: <b>{settings.get('gate', 'soft')}</b>\n"
             f"{ch}\n\nأراقب كل شمعة عند إغلاقها وأنشر التوصية بصورة الشارت في القناة، ثم أعلن تحقق الهدف الأول والثاني.\n\n"
-            "اضغط <b>📋 جميع الأوامر</b> لقائمة الأوامر، أو <b>🎛️ الأزرار</b> لباقي الأزرار.\n"
+            "أزرار الأوامر ظاهرة أسفل الرسائل مباشرة؛ اضغط <b>🧹 إخفاء الأزرار</b> لطيّها، و<b>📋 قائمة الأوامر</b> لعرض النص.\n"
             "<i>تحليل فني آلي وليس توصية استثمارية. الأداء السابق لا يضمن المستقبل.</i>", chat, keyboard())
 
 
@@ -2128,7 +2134,7 @@ def handle(text, chat):
 
 # ============================== الويب هوك ==============================
 PUBLIC_CMDS = {"start", "help", "commands", "price", "levels", "stats"}
-PUBLIC_CB = {"menu_panel", "menu_hide", "menu_cmds", "price", "levels", "stats"}
+PUBLIC_CB = {"menu_panel", "menu_show", "menu_hide", "menu_cmds", "price", "levels", "stats"}
 _pub_hits = {}
 
 
@@ -2160,8 +2166,9 @@ def handle_callback(data, chat, mid, owner):
     def edit(kb):
         try: _tg("editMessageReplyMarkup", data={"chat_id": chat, "message_id": mid, "reply_markup": json.dumps(kb)})
         except Exception: pass
-    if data == "menu_panel": edit(panel_keyboard()); return True
-    if data == "menu_hide": edit(keyboard()); return True
+    if data == "menu_panel": edit(keyboard()); return True
+    if data == "menu_show": edit(keyboard()); return True
+    if data == "menu_hide": edit(hidden_keyboard()); return True
     if data == "menu_cmds": tg_text(commands_text(owner), chat, keyboard()); return True
     if not data.startswith("ch_") or not owner:
         return False
