@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 tdawll v2 — بوت تحليل S&P 500 (SPY / SPX) على تيليجرام
-البيانات: Alpaca IEX فقط | الذكاء: Groq فقط | الاستضافة: Render المجاني
+البيانات: Alpaca IEX فقط | الذكاء: DeepSeek فقط | الاستضافة: Render المجاني
 """
 import os, io, re, json, time, html, logging, threading
 from collections import deque
@@ -51,6 +51,7 @@ DIR_TXT = {1: "إعدادية شراء", -1: "إعدادية بيع", 0: "حيا
 
 chat_memory = {}
 pool = ThreadPoolExecutor(max_workers=3)
+ai_pool = ThreadPoolExecutor(max_workers=2)          # نداءات الذكاء بعد النشر (خارج المسار الحرج)
 _seen_updates = deque(maxlen=300)
 _cache = {}
 _ml_cache = {}
@@ -166,6 +167,27 @@ def tg_text(text, chat_id=None, kb=None, reply_to=None):
         except Exception as e:
             _last_tg_err["v"] = str(e)[:200]
             log.warning("tg_text err: %s", e)
+    return False
+
+
+def tg_edit(text, chat_id=None, message_id=None, kb=None):
+    """يعدّل نص رسالة قائمة (لتحديث التوصية برأي اللجنة بعد النشر). يرجع True/False."""
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_TOKEN or not chat_id or not isid(message_id) or not text:
+        return False
+    for mode in ("HTML", None):
+        try:
+            body = text[:4000] if mode else re.sub(r"<[^>]+>", "", html.unescape(text))[:4000]
+            d = {"chat_id": chat_id, "message_id": message_id, "text": body, "disable_web_page_preview": True}
+            if mode: d["parse_mode"] = mode
+            if kb: d["reply_markup"] = json.dumps(kb)
+            r = _tg("editMessageText", data=d)
+            if r.status_code == 200:
+                return True
+            _last_tg_err["v"] = f"{r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            _last_tg_err["v"] = str(e)[:200]
+            log.warning("tg_edit err: %s", e)
     return False
 
 
@@ -811,10 +833,10 @@ def card_text(S, with_news=True, ext=False):
     return "\n".join(lines)
 
 
-# ============================== العقل (Groq) ==============================
+# ============================== العقل (DeepSeek) ==============================
 def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
-    if not llm.GROQ_API_KEY:
-        return "⚠️ مفتاح Groq غير مضبوط."
+    if not llm.DEEPSEEK_API_KEY:
+        return "⚠️ مفتاح DeepSeek غير مضبوط."
     hist = chat_memory.get(chat_id, []) if chat_id else []
     contents = [{"role": "user" if m["r"] == "u" else "model", "parts": [{"text": m["c"]}]} for m in hist[-6:]]
     body = (f"[البطاقة الفنية الحية — المصدر الوحيد للأرقام]\n{card}\n\n" if card else
@@ -830,7 +852,7 @@ def brain(task, card=None, chat_id=None, deep=False, tokens=500, memo=None):
 
 
 def local_expectation(S):
-    """رد احتياطي فوري لا يعتمد على Groq؛ يستخدم أرقام البطاقة الحالية فقط."""
+    """رد احتياطي فوري لا يعتمد على DeepSeek؛ يستخدم أرقام البطاقة الحالية فقط."""
     l, p = S["l"], S.get("plan")
     score = int(S.get("score", 0)); direction = int(S.get("dir", 0))
     trend = "صاعد" if l["EMA9"] > l["EMA21"] else "هابط"
@@ -1308,36 +1330,10 @@ def live_scan(force_chat=None):
         return 0
     best, others = fresh[0], fresh[1:]
 
-    # لجنة التداول: ثور/دب/حكم في طلب Groq واحد، مع دروس سابقة وموقفك الحالي
     gate = settings.get("gate", "soft")
-    cm = None
-    if gate != "off":
-        cm = agents.committee_lite(card_text(S, True, ext=True), S["label"], best,
-                                   agents.lessons_context(lessons, best["name"]),
-                                   agents.position_context(pos_state["v"], S["price"], S["atr"]))
-    if cm:
-        best["ai_rating"], best["ai_agree"], best["ai_conf"] = cm["rating"], cm["agree"], cm["confidence"]
-        best["ai_decision"], best["ai_regime"] = cm.get("decision", "wait"), cm.get("regime", "unclear")
-        best["ai_data_quality"] = cm.get("data_quality", "degraded")
-    veto = bool(cm and cm["agree"] == -1)
-    if cm and cm.get("data_quality") == "stale":
-        veto = True
-    if cm and cm.get("decision") in {"reject", "wait"} and cm.get("confidence") == "high":
-        veto = True
-    if veto and gate == "hard":                            # نسجّلها لنقيس: هل كان الفيتو في محله؟
-        for x in fresh: x["sent"] = False; x["ann"] = False; x["done"] = False; x["label"] = S["label"]; x["ev"] = []
-        best["vetoed"] = True
-        with _lock: live_sigs.extend(fresh)
-        save_state()
-        log.info("alert vetoed by committee: %s %s", best["name"], best["dir"])
-        _scan_set("vetoed", f"اللجنة حجبت الإشارة: {cm.get('decision', 'conflict') if cm else 'conflict'}")
-        return 0
+    # النشر فوراً بأرقام الكود فقط. نداء الذكاء/اللجنة يجري في الخلفية بعد النشر
+    # ثم نحدّث الرسالة، حتى لا يؤخر أي خلل في المزود نشر التوصية.
     txt = signal_text(best, S, None, others)
-    if cm:
-        txt += "\n\n" + agents.lite_block(cm)
-        if veto: txt += "\n⛔ <b>اللجنة تعارض هذه الإشارة</b>: خفّض الحجم أو تجاهلها."
-    else:
-        txt += "\n\n🧠 " + fmt_ai(brain(sig_task(best, others), card_text(S, True), None, deep=False, tokens=260))
     dest = chan(); pub = dest == CHANNEL_ID and bool(CHANNEL_ID)
     if pub: txt += "\n\n⚠️ <i>تحليل فني آلي وليس توصية استثمارية. التزم بالوقف وإدارة المخاطر.</i>"
     side = "شراء" if best["dir"] > 0 else "بيع"
@@ -1359,7 +1355,40 @@ def live_scan(force_chat=None):
     with _lock: live_sigs.extend(fresh)
     save_state()
     _scan_set("posted" if posted else "send_failed", "تم نشر الإشارة" if posted else f"فشل الإرسال: {_last_tg_err['v']}")
+    if posted and gate != "off":
+        try:
+            ai_pool.submit(_ai_followup, best, others, S, txt, dest, best["msg_id"], gate)
+        except Exception:
+            log.exception("ai followup submit")
     return len(fresh)
+
+
+def _ai_followup(best, others, S, txt, dest, mid, gate):
+    """بعد النشر: نداء الذكاء/اللجنة في الخلفية ثم نحدّث رسالة التوصية.
+    لا يحجب النشر أبداً؛ أي فشل هنا يُسجَّل فقط وتبقى الرسالة الأصلية كما هي."""
+    try:
+        cm = agents.committee_lite(card_text(S, True, ext=True), S["label"], best,
+                                   agents.lessons_context(lessons, best["name"]),
+                                   agents.position_context(pos_state["v"], S["price"], S["atr"]))
+        block = None
+        if cm:
+            best["ai_rating"], best["ai_agree"], best["ai_conf"] = cm["rating"], cm["agree"], cm["confidence"]
+            best["ai_decision"], best["ai_regime"] = cm.get("decision", "wait"), cm.get("regime", "unclear")
+            best["ai_data_quality"] = cm.get("data_quality", "degraded")
+            block = agents.lite_block(cm)
+            veto = (cm["agree"] == -1) or cm.get("data_quality") == "stale" or \
+                   (cm.get("decision") in {"reject", "wait"} and cm.get("confidence") == "high")
+            if veto:
+                block += "\n⛔ <b>اللجنة تعارض هذه الإشارة</b>: خفّض الحجم أو تجاهلها."
+                if gate == "hard": best["vetoed"] = True
+        else:
+            note = brain(sig_task(best, others), card_text(S, True), None, deep=False, tokens=260)
+            if note: block = "🧠 " + fmt_ai(note)
+        if block and not tg_edit(txt + "\n\n" + block, dest, mid, dest_kb(dest)):
+            log.warning("ai followup edit failed for %s", dest)
+        save_state()
+    except Exception:
+        log.exception("ai followup")
 
 
 def _reflect_store(sg):
@@ -1802,7 +1831,7 @@ def h_stats(chat):
             L.append("<i>هذه فرضيات من بحث الغاما: حتى تثبت هنا بعشرات الصفقات اعتبرها سياقاً لا قاعدة.</i>")
     else:
         L.append("\nلا توجد إشارات حية مكتملة بعد.")
-    L.append(f"\n🧠 دروس محفوظة: {len(lessons)} · استدعاءات Groq منذ التشغيل: {llm.stats['calls']} (فشل {llm.stats['fail']})")
+    L.append(f"\n🧠 دروس محفوظة: {len(lessons)} · استدعاءات DeepSeek منذ التشغيل: {llm.stats['calls']} (فشل {llm.stats['fail']})")
     if BT.get("stats"):
         L.append(f"\n<b>باكتست {BT['days']} يوم ({BT['symbol']}) — شموع 5د</b>")
         for k, v in sorted(BT["stats"].items(), key=lambda kv: -kv[1]["avgR"]):
@@ -1888,7 +1917,7 @@ def h_sentiment(chat):
         out.append(f"\n<b>{agents.BAND_AR.get(rep_['overall_band'], rep_['overall_band'])}</b> · {float(rep_['overall_score']):.1f}/10 · "
                    f"{agents.CONF_AR.get(rep_.get('confidence'), '')}\n{fmt_ai(rep_['narrative'])}")
     else:
-        out.append("\n⚠️ تعذّر توليد تقرير المزاج (Groq). هذه البيانات الخام:")
+        out.append("\n⚠️ تعذّر توليد تقرير المزاج (DeepSeek). هذه البيانات الخام:")
     out.append("\n" + html.escape("\n".join(x for x in lines if not x.startswith("  "))))
     tg_text("\n".join(out), chat, keyboard())
 
@@ -1938,7 +1967,7 @@ def h_gate(chat, arg=""):
     g = (arg or "").strip().lower()
     if g not in ("soft", "hard", "off"):
         return tg_text(f"البوابة الحالية: <b>{settings.get('gate', 'soft')}</b>\n• soft: تُرسل كل الفرص وتُوسم إن عارضتها اللجنة\n"
-                       "• hard: الفرصة التي تعارضها اللجنة لا تُرسل (لكن تُسجَّل لنقيس صحة الفيتو)\n• off: بدون لجنة على التنبيهات (يوفر حصة Groq)",
+                       "• hard: الفرصة التي تعارضها اللجنة لا تُرسل (لكن تُسجَّل لنقيس صحة الفيتو)\n• off: بدون لجنة على التنبيهات (يوفر حصة DeepSeek)",
                        chat, keyboard())
     settings["gate"] = g; save_state()
     tg_text(f"✅ بوابة اللجنة: <b>{g}</b>", chat, keyboard())
@@ -2070,7 +2099,7 @@ BUTTON_INTENTS = (
 
 
 def natural_button(text, chat):
-    """يفهم طلبات الأزرار العربية بدون استهلاك حصة Groq."""
+    """يفهم طلبات الأزرار العربية بدون استهلاك حصة DeepSeek."""
     t = re.sub(r"\s+", " ", (text or "").strip().lower())
     if not any(k in t for k in ("زر", "الأزرار", "الازرار", "لوحة", "أرسل", "ارسل", "ابغى", "ابي")):
         return False
@@ -2211,7 +2240,7 @@ def health():
         live = dict(_live_ws)
     live["last_trade_age_sec"] = (round(time.time() - live["last_trade"], 1)
                                    if live.get("last_trade") else None)
-    return jsonify({"status": "ok", "bot": "tdawll-v3.5-groq-monitor", "version": "groq-only-testfix", "focus": state["focus"], "timeframe": "5m",
+    return jsonify({"status": "ok", "bot": "tdawll-v3.6-deepseek-monitor", "version": "deepseek-only", "focus": state["focus"], "timeframe": "5m",
                     "monitor": {"heartbeat": _monitor_heartbeat,
                                 "age_sec": round(time.time() - _monitor_heartbeat, 1) if _monitor_heartbeat else None},
                     "data_primary": "alpaca_rest_snapshot" if not ALPACA_WS_ENABLED else "alpaca_iex_websocket",
