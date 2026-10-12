@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 طبقة LLM للبوت.
-المحرك الوحيد: Groq المجاني، ولا يوجد مزود احتياطي.
+المحرك الوحيد: DeepSeek (واجهة متوافقة مع OpenAI)، ولا يوجد مزود احتياطي.
 المفتاح اختياري؛ ولا يُسجَّل أو يُكشف في الردود.
 
 التفاصيل:
   - مخرجات JSON منظمة (response_format=json_object) مع استخراج متوازن للنص.
-  - ضبط reasoning_effort لكل نموذج حسب ما يقبله Groq فعلاً (gpt-oss يقبل low/medium/high فقط،
-    وQwen يقبل none/default أو low/medium/high) لتفادي أخطاء HTTP 400.
-  - حد معدل للطلبات (LLM_RPM) حتى لا تُستنزف الحصة المجانية أثناء نقاش اللجنة.
+  - نموذج واحد للنمط السريع و«العميق» (DEEPSEEK_MODEL)، ويمكن ضبط الطلب عبر temperature.
+  - حد معدل للطلبات (LLM_RPM) حتى لا يُستنزف الرصيد أثناء نقاش اللجنة.
 """
 import os, re, json, time, logging, threading
 from collections import deque
@@ -17,11 +16,11 @@ import requests
 
 log = logging.getLogger("tdawll.llm")
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-PROVIDER_ORDER = ["groq"]
-GROQ_FAST = [m.strip() for m in os.environ.get("GROQ_FAST_MODELS", "qwen/qwen3.8-27b,openai/gpt-oss-120b").split(",") if m.strip()]
-GROQ_DEEP = [m.strip() for m in os.environ.get("GROQ_DEEP_MODELS", "qwen/qwen3.8-27b,openai/gpt-oss-120b").split(",") if m.strip()]
-RPM = int(os.environ.get("LLM_RPM", "9"))            # أقصى طلبات في الدقيقة (الحصة المجانية محدودة)
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE = os.environ.get("DEEPSEEK_BASE", "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+PROVIDER_ORDER = ["deepseek"]
+RPM = int(os.environ.get("LLM_RPM", "30"))           # أقصى طلبات في الدقيقة
 
 _calls, _lk = deque(), threading.Lock()
 stats = {"calls": 0, "fail": 0}
@@ -86,57 +85,41 @@ def _openai_messages(system, contents, json_mode=False):
         if text:
             msgs.append({"role": role, "content": text})
     if json_mode:
-        # Groq يرفض response_format=json_object إن لم تذكر الرسائل كلمة json.
+        # DeepSeek يشترط ذكر كلمة json في الرسائل عند response_format=json_object.
         msgs[-1]["content"] += "\n\nRespond with a single valid JSON object only."
     return msgs
 
-def _reasoning_effort(model, deep):
-    """Groq يرفض 'none' لنماذج gpt-oss (يقبل low/medium/high فقط)، وQwen يقبل
-    none/default أو low/medium/high. نختار قيمة مقبولة لكل عائلة لتفادي HTTP 400."""
-    want = "medium" if deep else "none"
-    low = model.lower()
-    if "gpt-oss" in low or "oss-" in low:
-        return "low" if not deep else "medium"
-    if "qwen" in low:
-        return want
-    return None
-
 
 def _compatible_generate(system, contents, deep, tokens, schema, temperature):
-    if not GROQ_API_KEY:
+    if not DEEPSEEK_API_KEY:
         return None
     messages = _openai_messages(system, contents, json_mode=bool(schema))
-    for mdl in (GROQ_DEEP if deep else GROQ_FAST):
-        _throttle(); stats["calls"] += 1
-        body = {"model": mdl, "messages": messages, "temperature": temperature,
-                "max_completion_tokens": max(64, tokens + (700 if deep else 350)),
-                "stream": False, "include_reasoning": False}
-        effort = _reasoning_effort(mdl, deep)
-        if effort:
-            body["reasoning_effort"] = effort
-        if schema:
-            body["response_format"] = {"type": "json_object"}
-        if "qwen" in mdl.lower():
-            # Qwen يشترط reasoning_format=parsed مع JSON mode لتفادي أخطاء الطلب.
-            body["reasoning_format"] = "parsed"
-        try:
-            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                              headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                              json=body, timeout=20)
-            if r.status_code == 200:
-                choices = r.json().get("choices", [])
-                txt = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
-                if txt: return txt
-                log.warning("groq EMPTY %s", mdl)
-            else:
-                log.warning("groq HTTP%s %s: %s", r.status_code, mdl, r.text[:160])
-                if r.status_code == 429: time.sleep(1.0)
-        except Exception as e:
-            log.warning("groq EXC %s: %s", mdl, str(e)[:120])
+    _throttle(); stats["calls"] += 1
+    body = {"model": DEEPSEEK_MODEL, "messages": messages, "temperature": temperature,
+            "max_tokens": max(64, tokens + (700 if deep else 350)),
+            "stream": False}
+    if schema:
+        body["response_format"] = {"type": "json_object"}
+    try:
+        r = requests.post(f"{DEEPSEEK_BASE}/chat/completions",
+                          headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
+                          json=body, timeout=30)
+        if r.status_code == 200:
+            choices = r.json().get("choices", [])
+            txt = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+            if txt:
+                return txt
+            log.warning("deepseek EMPTY %s", DEEPSEEK_MODEL)
+        else:
+            log.warning("deepseek HTTP%s %s: %s", r.status_code, DEEPSEEK_MODEL, r.text[:160])
+            if r.status_code == 429:
+                time.sleep(1.0)
+    except Exception as e:
+        log.warning("deepseek EXC %s: %s", DEEPSEEK_MODEL, str(e)[:120])
     return None
 
 def generate(system, contents, deep=False, tokens=500, schema=None, temperature=0.3):
-    """يرجع نص Groq أو None؛ لا يوجد مزود احتياطي."""
+    """يرجع نص DeepSeek أو None؛ لا يوجد مزود احتياطي."""
     txt = _compatible_generate(system, contents, deep, tokens, schema, temperature)
     if txt:
         return txt
@@ -145,8 +128,9 @@ def generate(system, contents, deep=False, tokens=500, schema=None, temperature=
 
 def provider_status():
     configured = []
-    if GROQ_API_KEY: configured.append("groq")
-    return {"order": PROVIDER_ORDER, "configured": configured, "calls": stats["calls"], "failures": stats["fail"]}
+    if DEEPSEEK_API_KEY: configured.append("deepseek")
+    return {"order": PROVIDER_ORDER, "configured": configured, "model": DEEPSEEK_MODEL,
+            "calls": stats["calls"], "failures": stats["fail"]}
 
 def user_msg(text):
     return [{"role": "user", "parts": [{"text": text}]}]
