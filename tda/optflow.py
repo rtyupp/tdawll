@@ -12,7 +12,7 @@
   • البيانات متأخرة ~15 دقيقة. الاستنتاجات سياق وليست أوامر.
 """
 import os, re, time, math, gc, logging
-from datetime import datetime, date
+from datetime import datetime
 
 import numpy as np
 import requests

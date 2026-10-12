@@ -9,7 +9,6 @@
 الإضافة هنا: قيمة الهيكل عند وصول السعر لهدف الإشارة أو وقفها خلال ساعة (إعادة تسعير BSM).
 """
 import math
-from datetime import datetime
 
 import numpy as np
 
@@ -187,7 +186,6 @@ def build(chain, mins_left, sg=None, OF=None, width_hint=None):
 
 def describe(st, sg=None):
     """نص قصير لتيليجرام (بدون HTML خاص)."""
-    e = st["ev"]
     cost = st["cost"]
     side = "دفع" if cost > 0 else "استلام"
     parts = [f"{side} ${abs(cost):.0f}"]

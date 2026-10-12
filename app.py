@@ -271,7 +271,7 @@ def dest_kb(dest):
 
 # ============================== البيانات ==============================
 def _overlay_live_bar(df, symbol):
-    """يضيف آخر شمعة مجمّعة من WebSocket فوق تاريخ Finnhub إن توفرت."""
+    """يضيف آخر شمعة مجمّعة من WebSocket/REST فوق تاريخ Alpaca إن توفرت."""
     if df is None or symbol != PRIMARY_LIVE_SYMBOL:
         return df
     with _live_lock:
@@ -1221,7 +1221,7 @@ def signal_text(sg, S, ai=None, others=None):
            f"<b>{SETUP_AR[sg['name']]}</b> — {side}",
            f"دخول ≈ <b>{sg['entry']:.2f}</b> (إغلاق شمعة {ts:%H:%M} ET)",
            f"وقف <b>{sg['stop']:.2f}</b> (مخاطرة {sg['risk']:.2f}$)",
-           f"هدف1 <b>{sg['t1']:.2f}</b> ({sg['rr1']:.1f}R{'' if sg['t1n'].endswith('R') else ' · ' + html.escape(sg['t1n'])}) · هدف2 <b>{sg['t2']:.2f}</b> ({sg['rr2']:.1f}R)",
+           f"هدف1 <b>{sg['t1']:.2f}</b> ({sg['rr1']:.1f}R{'' if sg.get('t1n', 'R').endswith('R') else ' · ' + html.escape(sg['t1n'])}) · هدف2 <b>{sg['t2']:.2f}</b> ({sg['rr2']:.1f}R)",
            "✅ " + html.escape("؛ ".join(sg["notes"]))]
     pl = perf_line(sg["name"])
     if pl: out.append(pl)
@@ -1601,7 +1601,7 @@ def h_commands(chat, arg=""):
 def h_data_status(chat, arg=""):
     with _live_lock: live = dict(_live_ws)
     age = (time.time() - live["last_trade"] if live.get("last_trade") else None)
-    msg = (f"📡 <b>حالة البيانات</b>\nالمصدر الأساسي: Alpaca IEX WebSocket + REST كل 15 ثانية\n"
+    msg = (f"📡 <b>حالة البيانات</b>\nالمصدر الأساسي: Alpaca IEX WebSocket + REST Snapshot كل 5 ثوانٍ\n"
            f"الحالة: <b>{live.get('state')}</b>\n"
            f"آخر Tick: {f'قبل {age:.1f} ثانية' if age is not None else 'لا يوجد بعد'}\n"
            f"مصدر الشموع: <b>{_data_meta.get('source')}</b> · عددها {_data_meta.get('bars', 0)}\n"

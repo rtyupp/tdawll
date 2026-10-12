@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-طبقة LLM متعددة المزودين للبوت.
+طبقة LLM للبوت.
 المحرك الوحيد: Groq المجاني، ولا يوجد مزود احتياطي.
-كل مزود اختياري؛ لا يتم تسجيل المفاتيح أو كشفها في الردود.
+المفتاح اختياري؛ ولا يُسجَّل أو يُكشف في الردود.
 
-الإضافات على النسخة السابقة:
-  - مخرجات JSON منظمة (responseSchema) مع تراجع تلقائي إن لم يدعمها النموذج.
+التفاصيل:
+  - مخرجات JSON منظمة (response_format=json_object) مع استخراج متوازن للنص.
+  - ضبط reasoning_effort لكل نموذج حسب ما يقبله Groq فعلاً (gpt-oss يقبل low/medium/high فقط،
+    وQwen يقبل none/default أو low/medium/high) لتفادي أخطاء HTTP 400.
   - حد معدل للطلبات (LLM_RPM) حتى لا تُستنزف الحصة المجانية أثناء نقاش اللجنة.
 """
 import os, re, json, time, logging, threading
@@ -76,27 +78,47 @@ def extract_json(text):
     return None
 
 
-def _openai_messages(system, contents):
+def _openai_messages(system, contents, json_mode=False):
     msgs = [{"role": "system", "content": system}]
     for m in contents:
         role = "assistant" if m.get("role") == "model" else m.get("role", "user")
         text = "".join(p.get("text", "") for p in m.get("parts", []) if isinstance(p, dict))
         if text:
             msgs.append({"role": role, "content": text})
+    if json_mode:
+        # Groq يرفض response_format=json_object إن لم تذكر الرسائل كلمة json.
+        msgs[-1]["content"] += "\n\nRespond with a single valid JSON object only."
     return msgs
+
+def _reasoning_effort(model, deep):
+    """Groq يرفض 'none' لنماذج gpt-oss (يقبل low/medium/high فقط)، وQwen يقبل
+    none/default أو low/medium/high. نختار قيمة مقبولة لكل عائلة لتفادي HTTP 400."""
+    want = "medium" if deep else "none"
+    low = model.lower()
+    if "gpt-oss" in low or "oss-" in low:
+        return "low" if not deep else "medium"
+    if "qwen" in low:
+        return want
+    return None
+
 
 def _compatible_generate(system, contents, deep, tokens, schema, temperature):
     if not GROQ_API_KEY:
         return None
-    messages = _openai_messages(system, contents)
+    messages = _openai_messages(system, contents, json_mode=bool(schema))
     for mdl in (GROQ_DEEP if deep else GROQ_FAST):
         _throttle(); stats["calls"] += 1
         body = {"model": mdl, "messages": messages, "temperature": temperature,
                 "max_completion_tokens": max(64, tokens + (700 if deep else 350)),
-                "stream": False, "reasoning_effort": "medium" if deep else "none",
-                "include_reasoning": False}
+                "stream": False, "include_reasoning": False}
+        effort = _reasoning_effort(mdl, deep)
+        if effort:
+            body["reasoning_effort"] = effort
         if schema:
             body["response_format"] = {"type": "json_object"}
+        if "qwen" in mdl.lower():
+            # Qwen يشترط reasoning_format=parsed مع JSON mode لتفادي أخطاء الطلب.
+            body["reasoning_format"] = "parsed"
         try:
             r = requests.post("https://api.groq.com/openai/v1/chat/completions",
                               headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
