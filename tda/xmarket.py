@@ -8,7 +8,6 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor, wait
 
-import numpy as np
 
 log = logging.getLogger("tdawll.xmarket")
 EQUITY = ("QQQ", "IWM", "XLK", "SMH")

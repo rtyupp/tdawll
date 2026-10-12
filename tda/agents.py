@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-وكلاء التداول — نسخة خفيفة من فلسفة TauricResearch/TradingAgents (Apache-2.0) فوق Gemini نفسه.
+وكلاء التداول — نسخة خفيفة من فلسفة TauricResearch/TradingAgents (Apache-2.0) فوق Groq.
 
 ما أُخذ منهم (والفكرة، لا الإطار الثقيل):
   • نقاش ثور/دب → مدير أبحاث → لجنة مخاطر (جريء/متحفظ/محايد) → مدير محفظة.
@@ -11,7 +11,7 @@
   • تأريض الأسعار: أي مستوى تقترحه اللجنة يُرفض إن لم يكن منطقياً بالنسبة للسعر وATR.
   • الموقف الحالي (position): لا نفترض أن حسابك فارغ إن لم تخبرنا.
 
-دمجتُ «المتداول» في مدير المحفظة ودمجتُ المتحدثين الثلاثة للمخاطر في طلب واحد لتوفير حصة Gemini المجانية.
+دمجتُ «المتداول» في مدير المحفظة ودمجتُ المتحدثين الثلاثة للمخاطر في طلب واحد لتوفير حصة Groq المجانية.
 """
 import html, time, logging
 from datetime import datetime
@@ -234,7 +234,7 @@ def full_debate(card, label, price, atr, sig=None, lessons="", position="", roun
 
 def debate_text(res, label, price):
     if not res.get("pm"):
-        return ("⚖️ <b>لجنة التداول</b>\n⚠️ تعذّر إكمال القرار النهائي (حصة Gemini أو خلل مؤقت). "
+        return ("⚖️ <b>لجنة التداول</b>\n⚠️ تعذّر إكمال القرار النهائي (حصة Groq أو خلل مؤقت). "
                 f"الأجزاء الناقصة: {', '.join(res.get('errors', [])) or 'غير معروف'}. أعد المحاولة بعد دقيقة.")
     e, pm = html.escape, res["pm"]
     g = res.get("grounded") or {}
@@ -247,7 +247,7 @@ def debate_text(res, label, price):
     elif pm.get("entry") or pm.get("stop") or pm.get("target"): out.append("🎯 مستويات اللجنة رُفضت لأنها غير منطقية بالنسبة للسعر وATR")
     if pm.get("horizon"): out.append(f"⏱️ الأفق: {e(str(pm['horizon']))}")
     if res["errors"]: out.append(f"\n<i>ملاحظة: أجزاء لم تكتمل ({', '.join(res['errors'])}) فخُفّضت الثقة.</i>")
-    out.append(f"\n<i>{res['calls']} طلب Gemini · النقاش الكامل في الملف المرفق</i>")
+    out.append(f"\n<i>{res['calls']} طلب Groq · النقاش الكامل في الملف المرفق</i>")
     return "\n".join(out)
 
 
@@ -354,7 +354,7 @@ def report_html(label, price, res, card, sent=None):
             f"<details><summary>🛡️ لجنة المخاطر</summary>{p('Aggressive: ' + risk.get('aggressive', '')) if risk else ''}"
             f"{p('Conservative: ' + risk.get('conservative', '')) if risk else ''}{p('Neutral: ' + risk.get('neutral', '')) if risk else ''}</details>",
             f"<details><summary>📊 البطاقة الفنية المُدخلة</summary><pre>{e(card)}</pre></details>",
-            f"<footer>{res.get('calls', 0)} طلب Gemini · {datetime.now():%Y-%m-%d %H:%M} · تحليل آلي وليس توصية استثمارية</footer>"]
+            f"<footer>{res.get('calls', 0)} طلب Groq · {datetime.now():%Y-%m-%d %H:%M} · تحليل آلي وليس توصية استثمارية</footer>"]
     return ("<!doctype html><html lang='ar' dir='rtl'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<title>لجنة التداول</title><style>body{font-family:system-ui,Segoe UI,Tahoma,sans-serif;background:#0b0b0f;color:#e8e8ee;"
             "max-width:820px;margin:auto;padding:18px;line-height:1.7}h1{font-size:1.3rem}h2{font-size:1.05rem;color:#9ab;margin-top:1.4rem}"
