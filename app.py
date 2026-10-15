@@ -895,7 +895,7 @@ DEFAULT_DISABLED_SETUPS = "SWEEP,SQUEEZE,DIVERGENCE,RETEST"
 DISABLED = {x.strip().upper() for x in os.environ.get("DISABLED_SETUPS", DEFAULT_DISABLED_SETUPS).split(",") if x.strip()}
 COST_R = 0.05                                            # تكلفة افتراضية (انزلاق/عمولة) بوحدة R
 STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "/tmp"), "tdawll_state.json")
-settings = {"min_grade": os.environ.get("MIN_GRADE", "B").upper(), "gate": os.environ.get("AI_GATE", "soft").lower(), "account": None,
+settings = {"min_grade": os.environ.get("MIN_GRADE", "C").upper(), "gate": os.environ.get("AI_GATE", "soft").lower(), "account": None,
             "channel_on": True, "post_sl": True}
 live_sigs, price_alerts, BT, lessons = [], [], {}, []
 pos_state = {"v": None}
@@ -1309,10 +1309,10 @@ def live_scan(force_chat=None):
     if len(d) < 120:
         _scan_set("blocked", f"بيانات غير كافية: {len(d)} شمعة فقط")
         return 0
-    # سقف مجاني ومحافظ: لا نسمح بأكثر من ثلاث إشارات جديدة في جلسة واحدة.
+    # سقف يومي للإشارات الجديدة (افتراضياً 6، ويمكن تغييره عبر MAX_DAILY_SIGNALS).
     today = now_et().date()
     today_count = sum(1 for x in live_sigs if pd.Timestamp(x.get("ts", 0)).date() == today and x.get("ann"))
-    if today_count >= int(os.environ.get("MAX_DAILY_SIGNALS", "3")):
+    if today_count >= int(os.environ.get("MAX_DAILY_SIGNALS", "6")):
         _scan_set("blocked", f"تم بلوغ سقف إشارات الجلسة ({today_count})")
         return 0
     minr = GRADE_RANK.get(settings["min_grade"], 2)
